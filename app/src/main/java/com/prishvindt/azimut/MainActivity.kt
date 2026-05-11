@@ -1,10 +1,13 @@
 package com.prishvindt.azimut
 
 import android.app.Activity
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.app.AlertDialog
 import android.content.ContentResolver
 import android.content.Context
+import android.content.IntentFilter
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Configuration
@@ -14,12 +17,16 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.DragEvent
+import android.view.MotionEvent
 import android.view.Gravity
 import android.view.View
 import android.view.Window
@@ -46,7 +53,10 @@ import org.apache.poi.xwpf.usermodel.XWPFTableCell
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -59,19 +69,51 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var saf: SafStore
     private lateinit var contentFrame: FrameLayout
+    private lateinit var updateArea: LinearLayout
     private lateinit var tabRow: LinearLayout
     private lateinit var testsTab: TextView
     private lateinit var settingsTab: TextView
 
     private var activeScreen = Screen.TESTS
     private var runningTestFile: TestFile? = null
+    private var availableUpdate: UpdateInfo? = null
+    private var updateDismissedThisRun = false
+    private var updateExpanded = false
+    private var downloadInProgress = false
+    private var downloadFailureCount = 0
+    private var pendingInstallAfterPermission = false
+    private var updateDownloadId: Long = -1L
+
+    private val updateDownloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            val expectedId = if (updateDownloadId > 0L) updateDownloadId else prefs.getLong(PREF_LAST_DOWNLOAD_ID, -1L)
+            if (id <= 0L || id != expectedId) return
+            downloadInProgress = false
+            if (isDownloadSuccessful(id)) {
+                downloadFailureCount = 0
+                Toast.makeText(this@MainActivity, "Обновление скачано", Toast.LENGTH_SHORT).show()
+                startInstallDownloadedUpdate()
+            } else {
+                showDownloadFailedToast()
+            }
+        }
+    }
 
     companion object {
         private const val REQ_OPEN_TREE = 4100
         private const val PREFS_NAME = "azimut_prefs"
         private const val PREF_FOLDER_URI = "question_folder_uri"
         private const val PREF_THEME = "theme_mode"
-        private const val PREF_UPDATES_1_0_2_SHOWN = "updates_1_0_2_shown"
+        private const val PREF_CHANGELOG_1_1_0_SHOWN = "updates_1_1_0_shown"
+        private const val PREF_LAST_UPDATE_CHECK = "last_update_check_millis"
+        private const val PREF_LAST_DOWNLOAD_ID = "last_update_download_id"
+        private const val PREF_PENDING_INSTALL_AFTER_PERMISSION = "pending_install_after_permission"
+        private const val UPDATE_JSON_URL = "https://raw.githubusercontent.com/prishvindt/Azimut/main/update.json"
+        private const val UPDATE_APK_FILE_NAME = "Azimut-update.apk"
+        private const val APK_MIME = "application/vnd.android.package-archive"
+        private const val ONE_DAY_MILLIS = 24L * 60L * 60L * 1000L
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,14 +126,35 @@ class MainActivity : Activity() {
 
         saf = SafStore(this)
         contentFrame = findViewById(R.id.contentFrame)
+        updateArea = findViewById(R.id.updateArea)
         tabRow = findViewById(R.id.tabRow)
         testsTab = findViewById(R.id.testsTab)
         settingsTab = findViewById(R.id.settingsTab)
 
         testsTab.setOnClickListener { showTestsTab() }
         settingsTab.setOnClickListener { showSettingsTab() }
+        registerUpdateDownloadReceiver()
         showTestsTab()
-        contentFrame.post { showUpdatesDialogIfNeeded() }
+        contentFrame.post {
+            showUpdatesDialogIfNeeded()
+            checkForUpdates(force = false)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (pendingInstallAfterPermission || prefs.getBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, false)) {
+            if (canRequestPackageInstalls()) {
+                pendingInstallAfterPermission = false
+                prefs.edit().putBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, false).apply()
+                startInstallDownloadedUpdate()
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(updateDownloadReceiver) }
+        super.onDestroy()
     }
 
     private fun applySavedTheme() {
@@ -127,6 +190,7 @@ class MainActivity : Activity() {
         runningTestFile = null
         activeScreen = Screen.TESTS
         tabRow.visibility = View.VISIBLE
+        renderUpdateArea()
         setTabSelection(true)
         contentFrame.removeAllViews()
 
@@ -173,6 +237,7 @@ class MainActivity : Activity() {
         runningTestFile = null
         activeScreen = Screen.SETTINGS
         tabRow.visibility = View.VISIBLE
+        renderUpdateArea()
         setTabSelection(false)
         contentFrame.removeAllViews()
 
@@ -193,6 +258,12 @@ class MainActivity : Activity() {
         box.addView(button("Обновить список файлов") { refreshDocxListMessage() })
         box.addView(spacer(8))
         box.addView(button("Создать тест") { chooseDocxForNewTest() })
+        box.addView(spacer(24))
+
+        box.addView(sectionTitle("Обновления"))
+        box.addView(text("Текущая версия: ${BuildConfig.VERSION_NAME}", 15, false))
+        box.addView(spacer(8))
+        box.addView(button("Проверить обновления") { checkForUpdates(force = true) })
         box.addView(spacer(24))
 
         // Настройка темы скрыта. Логика оставлена в коде, приложение использует системную тему.
@@ -589,6 +660,7 @@ class MainActivity : Activity() {
         val attempt = file.template.activeAttempt ?: return
         runningTestFile = file
         tabRow.visibility = View.GONE
+        updateArea.visibility = View.GONE
         contentFrame.removeAllViews()
 
         val root = LinearLayout(this).apply {
@@ -1075,18 +1147,282 @@ class MainActivity : Activity() {
     }
 
     private fun showUpdatesDialogIfNeeded() {
-        if (prefs.getBoolean(PREF_UPDATES_1_0_2_SHOWN, false)) return
-        prefs.edit().putBoolean(PREF_UPDATES_1_0_2_SHOWN, true).apply()
+        if (prefs.getBoolean(PREF_CHANGELOG_1_1_0_SHOWN, false)) return
+        prefs.edit().putBoolean(PREF_CHANGELOG_1_1_0_SHOWN, true).apply()
         AlertDialog.Builder(this)
-            .setTitle("Что нового")
+            .setTitle("Что нового в версии 1.1.0")
             .setMessage(
                 """
-                Исправление:
-                Добавлена поддержка изображений. Теперь картинки, используемые в вопросах, отображаются при прохождении теста.
+                Добавлено:
+                - Проверка обновлений внутри приложения.
+                - Загрузка и запуск установки новой версии из приложения.
+                - Автоматическое добавление .nomedia в папки с изображениями, чтобы картинки тестов не попадали в галерею.
+
+                Исправлено:
+                - Улучшена работа с папками изображений тестов.
                 """.trimIndent()
             )
             .setPositiveButton("ОК", null)
             .show()
+    }
+
+    private fun registerUpdateDownloadReceiver() {
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(updateDownloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(updateDownloadReceiver, filter)
+        }
+    }
+
+    private fun checkForUpdates(force: Boolean) {
+        if (!force) {
+            val lastCheck = prefs.getLong(PREF_LAST_UPDATE_CHECK, 0L)
+            if (System.currentTimeMillis() - lastCheck < ONE_DAY_MILLIS) return
+        }
+        thread {
+            var failed = false
+            val result = try {
+                val info = fetchUpdateInfo()
+                if (!force) prefs.edit().putLong(PREF_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply()
+                info
+            } catch (_: Exception) {
+                failed = true
+                if (!force) prefs.edit().putLong(PREF_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply()
+                null
+            }
+            runOnUiThread {
+                if (result != null && result.versionCode > BuildConfig.VERSION_CODE && result.apkUrl.isNotBlank()) {
+                    availableUpdate = result
+                    updateDismissedThisRun = false
+                    updateExpanded = false
+                    renderUpdateArea()
+                    if (force) Toast.makeText(this, "Доступна новая версия", Toast.LENGTH_SHORT).show()
+                } else if (force && failed) {
+                    Toast.makeText(this, "Не удалось проверить обновления", Toast.LENGTH_SHORT).show()
+                } else if (force) {
+                    Toast.makeText(this, "Установлена актуальная версия", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun fetchUpdateInfo(): UpdateInfo {
+        val connection = (URL(UPDATE_JSON_URL).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8000
+            readTimeout = 8000
+            requestMethod = "GET"
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Cache-Control", "no-cache")
+        }
+        return try {
+            val code = connection.responseCode
+            if (code !in 200..299) throw UserVisibleException("Не удалось проверить обновления")
+            val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            UpdateInfo.fromJson(JSONObject(body))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun renderUpdateArea() {
+        updateArea.removeAllViews()
+        val info = availableUpdate
+        if (info == null || updateDismissedThisRun) {
+            updateArea.visibility = View.GONE
+            return
+        }
+        updateArea.visibility = View.VISIBLE
+
+        val banner = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(8), dp(10), dp(8))
+            background = rounded(Color.rgb(223, 245, 225), 0, Color.TRANSPARENT, 0)
+        }
+        var downX = 0f
+        banner.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.rawX
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val delta = event.rawX - downX
+                    if (kotlin.math.abs(delta) > dp(90)) {
+                        updateDismissedThisRun = true
+                        updateExpanded = false
+                        renderUpdateArea()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                else -> false
+            }
+        }
+        val title = TextView(this).apply {
+            text = "Доступна версия ${info.versionName}"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(31, 61, 42))
+        }
+        val download = TextView(this).apply {
+            text = "⬇"
+            textSize = 24f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(31, 61, 42))
+            setPadding(dp(10), dp(2), dp(10), dp(2))
+            setOnClickListener { startUpdateDownload(info) }
+        }
+        val arrow = TextView(this).apply {
+            text = if (updateExpanded) "▲" else "▼"
+            textSize = 20f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(31, 61, 42))
+            setPadding(dp(8), dp(2), dp(4), dp(2))
+            setOnClickListener {
+                updateExpanded = !updateExpanded
+                renderUpdateArea()
+            }
+        }
+        banner.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        banner.addView(download, LinearLayout.LayoutParams(dp(48), LinearLayout.LayoutParams.WRAP_CONTENT))
+        banner.addView(arrow, LinearLayout.LayoutParams(dp(40), LinearLayout.LayoutParams.WRAP_CONTENT))
+        updateArea.addView(banner)
+
+        if (updateExpanded) updateArea.addView(updateDetailsView(info))
+    }
+
+    private fun updateDetailsView(info: UpdateInfo): View {
+        val box = verticalContainer().apply {
+            background = rounded(if (isDark()) Color.rgb(38, 48, 40) else Color.rgb(241, 251, 242), dp(1), Color.rgb(160, 215, 170), 0)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+        }
+        val title = text("Что нового в ${info.versionName}", 18, true)
+        title.setTextColor(if (isDark()) Color.WHITE else Color.rgb(31, 61, 42))
+        box.addView(title)
+        box.addView(spacer(8))
+        val notes = text(info.releaseNotes.ifBlank { "Описание изменений не указано." }, 15, false)
+        notes.setTextColor(if (isDark()) Color.WHITE else Color.rgb(31, 61, 42))
+        box.addView(notes)
+        box.addView(spacer(14))
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val ok = button("ОК") {
+            updateExpanded = false
+            renderUpdateArea()
+        }
+        val install = button("Установить") { startUpdateDownload(info) }
+        buttons.addView(ok, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(0, 0, dp(6), 0) })
+        buttons.addView(install, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(6), 0, 0, 0) })
+        box.addView(buttons)
+        return box
+    }
+
+    private fun startUpdateDownload(info: UpdateInfo) {
+        if (downloadInProgress || isDownloadRunning()) {
+            Toast.makeText(this, "Обновление уже скачивается", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        if (dir != null) File(dir, UPDATE_APK_FILE_NAME).delete()
+        val request = DownloadManager.Request(Uri.parse(info.apkUrl)).apply {
+            setTitle("Азимут ${info.versionName}")
+            setDescription("Скачивание обновления")
+            setMimeType(APK_MIME)
+            setAllowedOverMetered(true)
+            setAllowedOverRoaming(true)
+            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            setDestinationInExternalFilesDir(this@MainActivity, Environment.DIRECTORY_DOWNLOADS, UPDATE_APK_FILE_NAME)
+        }
+        try {
+            val id = manager.enqueue(request)
+            updateDownloadId = id
+            downloadInProgress = true
+            prefs.edit().putLong(PREF_LAST_DOWNLOAD_ID, id).apply()
+            Toast.makeText(this, "Скачивание обновления началось", Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
+            downloadInProgress = false
+            showDownloadFailedToast()
+        }
+    }
+
+    private fun isDownloadRunning(): Boolean {
+        val id = prefs.getLong(PREF_LAST_DOWNLOAD_ID, -1L)
+        if (id <= 0L) return false
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val cursor = manager.query(DownloadManager.Query().setFilterById(id)) ?: return false
+        cursor.use {
+            if (!it.moveToFirst()) return false
+            val status = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            return status == DownloadManager.STATUS_PENDING || status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PAUSED
+        }
+    }
+
+    private fun isDownloadSuccessful(id: Long): Boolean {
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val cursor = manager.query(DownloadManager.Query().setFilterById(id)) ?: return false
+        cursor.use {
+            if (!it.moveToFirst()) return false
+            val status = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            return status == DownloadManager.STATUS_SUCCESSFUL
+        }
+    }
+
+    private fun startInstallDownloadedUpdate() {
+        val id = prefs.getLong(PREF_LAST_DOWNLOAD_ID, -1L)
+        if (id <= 0L) {
+            Toast.makeText(this, "Файл обновления не найден", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!canRequestPackageInstalls()) {
+            pendingInstallAfterPermission = true
+            prefs.edit().putBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, true).apply()
+            Toast.makeText(this, "Разрешите установку обновлений для приложения «Азимут», затем нажмите обновление ещё раз.", Toast.LENGTH_LONG).show()
+            openInstallPermissionSettings()
+            return
+        }
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val uri = manager.getUriForDownloadedFile(id)
+        if (uri == null) {
+            Toast.makeText(this, "Файл обновления не найден", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, APK_MIME)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            Toast.makeText(this, "Не удалось открыть установку обновления", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun canRequestPackageInstalls(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) packageManager.canRequestPackageInstalls() else true
+    }
+
+    private fun openInstallPermissionSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
+            startActivity(intent)
+        }
+    }
+
+    private fun showDownloadFailedToast() {
+        downloadFailureCount += 1
+        val message = if (downloadFailureCount == 1) {
+            "Не удалось скачать обновление, попробуйте снова."
+        } else {
+            "Не удалось скачать обновление, попробуйте позднее."
+        }
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private fun selectQuestionsProportionally(sources: List<SourceQuestions>, requested: Int): List<ParsedQuestion> {
@@ -1221,6 +1557,7 @@ class SafStore(private val activity: Activity) {
 
     fun loadTests(rootTreeUri: Uri): TestLoadResult {
         val testDir = ensureTestDir(rootTreeUri)
+        ensureNoMediaInExistingAssets(testDir)
         val warnings = mutableListOf<String>()
         val tests = mutableListOf<TestFile>()
         val files = listChildren(testDir).filter { !it.isDirectory && it.name.endsWith(".json", true) }
@@ -1247,10 +1584,13 @@ class SafStore(private val activity: Activity) {
 
     fun resetAttemptAssets(rootTreeUri: Uri, testFileName: String): Uri {
         val assets = ensureAssetsDir(rootTreeUri, testFileName)
+        ensureNoMedia(assets)
         val existing = listChildren(assets).firstOrNull { it.isDirectory && it.name == "attempt" }
         if (existing != null) deleteDocumentTree(existing.uri)
-        return DocumentsContract.createDocument(resolver, assets, DocumentsContract.Document.MIME_TYPE_DIR, "attempt")
+        val attempt = DocumentsContract.createDocument(resolver, assets, DocumentsContract.Document.MIME_TYPE_DIR, "attempt")
             ?: throw UserVisibleException("Не удалось создать папку изображений попытки.")
+        ensureNoMedia(attempt)
+        return attempt
     }
 
     fun deleteAttemptAssets(rootTreeUri: Uri, testFileName: String) {
@@ -1297,15 +1637,41 @@ class SafStore(private val activity: Activity) {
         val testDir = ensureTestDir(rootTreeUri)
         val name = testFileName.substringBeforeLast('.') + "_assets"
         val existing = listChildren(testDir).firstOrNull { it.isDirectory && it.name == name }
-        if (existing != null) return existing.uri
-        return DocumentsContract.createDocument(resolver, testDir, DocumentsContract.Document.MIME_TYPE_DIR, name)
+        if (existing != null) {
+            ensureNoMedia(existing.uri)
+            return existing.uri
+        }
+        val created = DocumentsContract.createDocument(resolver, testDir, DocumentsContract.Document.MIME_TYPE_DIR, name)
             ?: throw UserVisibleException("Не удалось создать папку изображений теста.")
+        ensureNoMedia(created)
+        return created
     }
 
     private fun findAssetsDir(rootTreeUri: Uri, testFileName: String): Uri? {
         val testDir = ensureTestDir(rootTreeUri)
         val name = testFileName.substringBeforeLast('.') + "_assets"
         return listChildren(testDir).firstOrNull { it.isDirectory && it.name == name }?.uri
+    }
+
+    private fun ensureNoMediaInExistingAssets(testDir: Uri) {
+        runCatching {
+            listChildren(testDir)
+                .filter { it.isDirectory && it.name.endsWith("_assets") }
+                .forEach { assets ->
+                    ensureNoMedia(assets.uri)
+                    listChildren(assets.uri).filter { it.isDirectory }.forEach { child -> ensureNoMedia(child.uri) }
+                }
+        }
+    }
+
+    private fun ensureNoMedia(dir: Uri) {
+        runCatching {
+            val exists = listChildren(dir).any { !it.isDirectory && it.name == ".nomedia" }
+            if (!exists) {
+                val uri = DocumentsContract.createDocument(resolver, dir, "application/octet-stream", ".nomedia")
+                if (uri != null) resolver.openOutputStream(uri, "wt")?.use { }
+            }
+        }
     }
 
     private fun deleteDocumentTree(uri: Uri) {
@@ -1774,6 +2140,18 @@ data class AttemptQuestion(
             json.optString("userInput", ""),
             json.optString("status", AnswerStatus.UNANSWERED.value),
             json.optBoolean("skipped", false)
+        )
+    }
+}
+
+data class UpdateInfo(val versionName: String, val versionCode: Int, val apkUrl: String, val releaseNotes: String, val required: Boolean) {
+    companion object {
+        fun fromJson(json: JSONObject): UpdateInfo = UpdateInfo(
+            versionName = json.optString("versionName", ""),
+            versionCode = json.optInt("versionCode", 0),
+            apkUrl = json.optString("apkUrl", ""),
+            releaseNotes = json.optString("releaseNotes", ""),
+            required = json.optBoolean("required", false)
         )
     }
 }

@@ -35,6 +35,13 @@
             android:textStyle="bold" />
     </LinearLayout>
 
+    <LinearLayout
+        android:id="@+id/updateArea"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:visibility="gone" />
+
     <FrameLayout
         android:id="@+id/contentFrame"
         android:layout_width="match_parent"

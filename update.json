@@ -1,0 +1,7 @@
+{
+  "versionName": "1.1.0",
+  "versionCode": 3,
+  "apkUrl": "https://github.com/prishvindt/Azimut/releases/download/v1.1.0/Azimut-1.1.0-release.apk",
+  "releaseNotes": "Добавлена проверка обновлений внутри приложения.\nДобавлена загрузка и запуск установки новой версии из приложения.\nДобавлено автоматическое создание .nomedia в папках с изображениями, чтобы картинки тестов не попадали в галерею.",
+  "required": false
+}
