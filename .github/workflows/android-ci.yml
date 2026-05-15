@@ -1,0 +1,35 @@
+name: android ci
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: set up jdk
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: build debug apk
+        run: ./gradlew :app:assembleDebug --no-daemon
