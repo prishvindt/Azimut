@@ -1300,6 +1300,12 @@ class MainActivity : Activity() {
     }
 
     private fun checkForUpdates(force: Boolean) {
+        if (BuildConfig.DEBUG) {
+            if (force) {
+                Toast.makeText(this, "Проверка обновлений отключена в debug-версии.", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
         if (!force) {
             val lastCheck = prefs.getLong(PREF_LAST_UPDATE_CHECK, 0L)
             if (System.currentTimeMillis() - lastCheck < ONE_DAY_MILLIS) return
