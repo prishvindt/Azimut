@@ -1177,7 +1177,7 @@ class MainActivity : Activity() {
             if (lostFolderAccessDialogVisible) return@runOnUiThread
             lostFolderAccessDialogVisible = true
             AlertDialog.Builder(this)
-                .setTitle("Папка с файлами утеряна")
+                .setTitle("Папка не найдена")
                 .setMessage(LOST_FOLDER_ACCESS_MESSAGE)
                 .setPositiveButton("Выбрать папку") { _, _ -> openFolderPicker() }
                 .setNegativeButton("Позже", null)
