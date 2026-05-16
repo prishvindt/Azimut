@@ -38,6 +38,7 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.RadioButton
@@ -73,8 +74,9 @@ class MainActivity : Activity() {
     private lateinit var contentFrame: FrameLayout
     private lateinit var updateArea: LinearLayout
     private lateinit var tabRow: LinearLayout
+    private lateinit var cardsTab: TextView
     private lateinit var testsTab: TextView
-    private lateinit var settingsTab: TextView
+    private lateinit var settingsButton: ImageButton
 
     private var activeScreen = Screen.TESTS
     private var runningTestFile: TestFile? = null
@@ -109,7 +111,7 @@ class MainActivity : Activity() {
         private const val PREFS_NAME = "azimut_prefs"
         private const val PREF_FOLDER_URI = "question_folder_uri"
         private const val PREF_THEME = "theme_mode"
-        private const val PREF_CHANGELOG_1_1_1_SHOWN = "updates_1_1_1_shown"
+        private const val PREF_CHANGELOG_1_2_0_SHOWN = "updates_1_2_0_shown"
         private const val PREF_LAST_UPDATE_CHECK = "last_update_check_millis"
         private const val PREF_LAST_DOWNLOAD_ID = "last_update_download_id"
         private const val PREF_PENDING_INSTALL_AFTER_PERMISSION = "pending_install_after_permission"
@@ -132,11 +134,13 @@ class MainActivity : Activity() {
         contentFrame = findViewById(R.id.contentFrame)
         updateArea = findViewById(R.id.updateArea)
         tabRow = findViewById(R.id.tabRow)
+        cardsTab = findViewById(R.id.cardsTab)
         testsTab = findViewById(R.id.testsTab)
-        settingsTab = findViewById(R.id.settingsTab)
+        settingsButton = findViewById(R.id.settingsButton)
 
+        cardsTab.setOnClickListener { showCardsTab() }
         testsTab.setOnClickListener { showTestsTab() }
-        settingsTab.setOnClickListener { showSettingsTab() }
+        settingsButton.setOnClickListener { showSettingsTab() }
         registerUpdateDownloadReceiver()
         validateSavedFolderAccess()
         showTestsTab()
@@ -203,12 +207,26 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun showCardsTab() {
+        runningTestFile = null
+        activeScreen = Screen.CARDS
+        tabRow.visibility = View.VISIBLE
+        renderUpdateArea()
+        setNavigationSelection(Screen.CARDS)
+        contentFrame.removeAllViews()
+
+        val empty = verticalContainer()
+        empty.gravity = Gravity.CENTER
+        empty.addView(text("Будет позже", 18, true))
+        contentFrame.addView(empty)
+    }
+
     private fun showTestsTab() {
         runningTestFile = null
         activeScreen = Screen.TESTS
         tabRow.visibility = View.VISIBLE
         renderUpdateArea()
-        setTabSelection(true)
+        setNavigationSelection(Screen.TESTS)
         contentFrame.removeAllViews()
 
         val rootUri = savedFolderUri()
@@ -258,7 +276,7 @@ class MainActivity : Activity() {
         empty.gravity = Gravity.CENTER
         empty.addView(text("Папка с вопросами не выбрана", 18, true))
         empty.addView(spacer(12))
-        empty.addView(button("Открыть параметры") { showSettingsTab() })
+        empty.addView(button("Открыть настройки") { showSettingsTab() })
         contentFrame.addView(empty)
     }
 
@@ -267,7 +285,7 @@ class MainActivity : Activity() {
         activeScreen = Screen.SETTINGS
         tabRow.visibility = View.VISIBLE
         renderUpdateArea()
-        setTabSelection(false)
+        setNavigationSelection(Screen.SETTINGS)
         contentFrame.removeAllViews()
 
         val scroll = ScrollView(this)
@@ -275,26 +293,31 @@ class MainActivity : Activity() {
         val box = verticalContainer()
         scroll.addView(box)
 
-        box.addView(sectionTitle("Папка с вопросами"))
-        box.addView(button("Выбрать папку с вопросами") { openFolderPicker() })
-        box.addView(spacer(8))
-
         val uri = savedFolderUri()
         val folderName = uri?.let { folderUri ->
             withFolderAccess(folderUri) { saf.displayNameForTree(folderUri) }
         }
-        box.addView(text(if (folderName != null) "Выбрана папка: $folderName" else "Папка не выбрана", 16, false))
+        val folderButtonText = if (folderName != null) "Папка: $folderName" else "Выбрать папку с вопросами"
+
+        box.addView(sectionTitle("Папка с вопросами"))
+        val folderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val folderButton = button(folderButtonText) { openFolderPicker() }
+        val refreshButton = iconButton(R.drawable.ic_refresh_24, "Обновить список файлов") { refreshDocxListMessage() }
+        folderRow.addView(folderButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(0, 0, dp(8), 0) })
+        folderRow.addView(refreshButton, LinearLayout.LayoutParams(dp(48), dp(48)))
+        box.addView(folderRow)
         box.addView(spacer(16))
 
-        box.addView(button("Обновить список файлов") { refreshDocxListMessage() })
-        box.addView(spacer(8))
         box.addView(button("Создать тест") { chooseDocxForNewTest() })
-        box.addView(spacer(24))
-
-        box.addView(sectionTitle("Обновления"))
-        box.addView(text("Текущая версия: ${BuildConfig.VERSION_NAME}", 15, false))
         box.addView(spacer(8))
         box.addView(button("Проверить обновления") { checkForUpdates(force = true) })
+        box.addView(spacer(8))
+        box.addView(text("Текущая версия: ${BuildConfig.VERSION_NAME}", 15, false))
+        box.addView(spacer(8))
+        box.addView(button("О приложении") { showAboutDialog() })
         box.addView(spacer(24))
 
         // Настройка темы скрыта. Логика оставлена в коде, приложение использует системную тему.
@@ -315,7 +338,7 @@ class MainActivity : Activity() {
     private fun refreshDocxListMessage() {
         val uri = savedFolderUri()
         if (uri == null) {
-            showMessage("Папка не выбрана", "Сначала выберите папку с вопросами.")
+            Toast.makeText(this, "Выберите папку с вопросами.", Toast.LENGTH_SHORT).show()
             return
         }
         try {
@@ -323,18 +346,35 @@ class MainActivity : Activity() {
                 showSettingsTab()
                 return
             }
-            val message = if (files.isEmpty()) {
-                "В выбранной папке нет файлов .docx."
-            } else {
-                "Найдено файлов .docx: ${files.size}\n\n" + files.joinToString("\n") { it.name }
-            }
-            showMessage("Список файлов", message)
+            val message = if (files.isEmpty()) "Новых файлов нет" else "Файлов найдено: ${files.size}"
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             if (handleLostFolderError(e)) {
                 showSettingsTab()
                 return
             }
             showMessage("Ошибка", "Не удалось обновить список файлов: ${e.safeMessage()}")
+        }
+    }
+
+    private fun showAboutDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("О приложении")
+            .setMessage(
+                "Название: Азимут\n" +
+                    "Версия: ${BuildConfig.VERSION_NAME}\n\n" +
+                    "Азимут — приложение для создания и прохождения тестов и для запоминания информации с помощью карточек."
+            )
+            .setNegativeButton("ОК", null)
+            .setPositiveButton("Открыть GitHub") { _, _ -> openGitHubPage() }
+            .show()
+    }
+
+    private fun openGitHubPage() {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/prishvindt/Azimut")))
+        } catch (_: Exception) {
+            Toast.makeText(this, "Не удалось открыть ссылку.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -1096,11 +1136,18 @@ class MainActivity : Activity() {
         return true
     }
 
-    private fun setTabSelection(testsSelected: Boolean) {
+    private fun setNavigationSelection(screen: Screen) {
+        val cardsSelected = screen == Screen.CARDS
+        val testsSelected = screen == Screen.TESTS
+        val settingsSelected = screen == Screen.SETTINGS
+
+        cardsTab.background = tabBackground(cardsSelected)
         testsTab.background = tabBackground(testsSelected)
-        settingsTab.background = tabBackground(!testsSelected)
+        settingsButton.background = tabBackground(settingsSelected)
+
+        cardsTab.setTextColor(if (cardsSelected) Color.WHITE else textColor())
         testsTab.setTextColor(if (testsSelected) Color.WHITE else textColor())
-        settingsTab.setTextColor(if (!testsSelected) Color.WHITE else textColor())
+        settingsButton.setColorFilter(if (settingsSelected) Color.WHITE else textColor())
     }
 
     private fun tabBackground(selected: Boolean): GradientDrawable = if (selected) {
@@ -1297,15 +1344,15 @@ class MainActivity : Activity() {
     }
 
     private fun showUpdatesDialogIfNeeded() {
-        if (prefs.getBoolean(PREF_CHANGELOG_1_1_1_SHOWN, false)) return
-        prefs.edit().putBoolean(PREF_CHANGELOG_1_1_1_SHOWN, true).apply()
+        if (prefs.getBoolean(PREF_CHANGELOG_1_2_0_SHOWN, false)) return
+        prefs.edit().putBoolean(PREF_CHANGELOG_1_2_0_SHOWN, true).apply()
         AlertDialog.Builder(this)
-            .setTitle("Что нового в версии 1.1.1")
+            .setTitle("Что нового в версии 1.2.0")
             .setMessage(
                 """
-                Исправлено:
-                - Улучшена обработка доступа к выбранной папке с вопросами.
-                - Если Android отозвал доступ к папке, приложение теперь показывает понятное сообщение и предлагает выбрать папку заново.
+                Добавлено:
+                - Вкладка «Карточки» с временной заглушкой.
+                - Настройки перенесены в отдельный экран под кнопкой с шестеренкой.
                 """.trimIndent()
             )
             .setPositiveButton("ОК", null)
@@ -1656,9 +1703,19 @@ class MainActivity : Activity() {
     }
     private fun button(value: String, click: () -> Unit): Button = Button(this).apply {
         text = value
+        setAllCaps(false)
         setTextColor(Color.WHITE)
         background = rounded(purple(), 0, Color.TRANSPARENT, dp(10))
         setPadding(dp(8), dp(8), dp(8), dp(8))
+        setOnClickListener { click() }
+    }
+    private fun iconButton(drawableRes: Int, description: String, click: () -> Unit): ImageButton = ImageButton(this).apply {
+        setImageResource(drawableRes)
+        contentDescription = description
+        background = rounded(purple(), 0, Color.TRANSPARENT, dp(10))
+        setColorFilter(Color.WHITE)
+        scaleType = ImageView.ScaleType.CENTER
+        setPadding(dp(10), dp(10), dp(10), dp(10))
         setOnClickListener { click() }
     }
     private fun spacer(heightDp: Int): View = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, dp(heightDp)) }
@@ -1691,7 +1748,7 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
     private fun formatDate(ms: Long): String = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale("ru", "RU")).format(Date(ms))
 
-    private enum class Screen { TESTS, SETTINGS }
+    private enum class Screen { CARDS, TESTS, SETTINGS }
 }
 
 private fun isLostFolderError(error: Throwable): Boolean {

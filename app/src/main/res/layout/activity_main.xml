@@ -12,27 +12,40 @@
         android:orientation="horizontal"
         android:paddingLeft="8dp"
         android:paddingRight="8dp"
-        android:gravity="center">
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/cardsTab"
+            android:layout_width="104dp"
+            android:layout_height="44dp"
+            android:gravity="center"
+            android:text="Карточки"
+            android:textSize="16sp"
+            android:textStyle="bold" />
 
         <TextView
             android:id="@+id/testsTab"
-            android:layout_width="0dp"
+            android:layout_width="104dp"
             android:layout_height="44dp"
-            android:layout_weight="1"
             android:gravity="center"
             android:text="Тесты"
             android:textSize="16sp"
             android:textStyle="bold" />
 
-        <TextView
-            android:id="@+id/settingsTab"
+        <Space
             android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <ImageButton
+            android:id="@+id/settingsButton"
+            android:layout_width="44dp"
             android:layout_height="44dp"
-            android:layout_weight="1"
-            android:gravity="center"
-            android:text="Параметры"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            android:background="@android:color/transparent"
+            android:contentDescription="Настройки"
+            android:padding="10dp"
+            android:scaleType="center"
+            android:src="@drawable/ic_settings_24" />
     </LinearLayout>
 
     <LinearLayout
