@@ -83,6 +83,7 @@ class MainActivity : Activity() {
     private var downloadFailureCount = 0
     private var pendingInstallAfterPermission = false
     private var updateDownloadId: Long = -1L
+    private var lostFolderAccessDialogVisible = false
 
     private val updateDownloadReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -106,7 +107,7 @@ class MainActivity : Activity() {
         private const val PREFS_NAME = "azimut_prefs"
         private const val PREF_FOLDER_URI = "question_folder_uri"
         private const val PREF_THEME = "theme_mode"
-        private const val PREF_CHANGELOG_1_1_0_SHOWN = "updates_1_1_0_shown"
+        private const val PREF_CHANGELOG_1_1_1_SHOWN = "updates_1_1_1_shown"
         private const val PREF_LAST_UPDATE_CHECK = "last_update_check_millis"
         private const val PREF_LAST_DOWNLOAD_ID = "last_update_download_id"
         private const val PREF_PENDING_INSTALL_AFTER_PERMISSION = "pending_install_after_permission"
@@ -114,6 +115,7 @@ class MainActivity : Activity() {
         private const val UPDATE_APK_FILE_NAME = "Azimut-update.apk"
         private const val APK_MIME = "application/vnd.android.package-archive"
         private const val ONE_DAY_MILLIS = 24L * 60L * 60L * 1000L
+        private const val LOST_FOLDER_ACCESS_MESSAGE = "Доступ к папке потерян. Выберите папку с вопросами заново."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -134,6 +136,7 @@ class MainActivity : Activity() {
         testsTab.setOnClickListener { showTestsTab() }
         settingsTab.setOnClickListener { showSettingsTab() }
         registerUpdateDownloadReceiver()
+        validateSavedFolderAccess()
         showTestsTab()
         contentFrame.post {
             showUpdatesDialogIfNeeded()
@@ -179,10 +182,18 @@ class MainActivity : Activity() {
             val flags = (data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION))
             try {
                 contentResolver.takePersistableUriPermission(uri, flags)
+            } catch (e: SecurityException) {
+                showMessage("Доступ не сохранен", LOST_FOLDER_ACCESS_MESSAGE)
+                return
             } catch (_: Exception) {
             }
             prefs.edit().putString(PREF_FOLDER_URI, uri.toString()).apply()
-            showSettingsTab()
+            if (!hasPersistedFolderPermission(uri)) {
+                handleLostFolderAccess()
+                showSettingsTab()
+                return
+            }
+            showTestsTab()
         }
     }
 
@@ -196,17 +207,15 @@ class MainActivity : Activity() {
 
         val rootUri = savedFolderUri()
         if (rootUri == null) {
-            val empty = verticalContainer()
-            empty.gravity = Gravity.CENTER
-            empty.addView(text("Папка с вопросами не выбрана", 18, true))
-            empty.addView(spacer(12))
-            empty.addView(button("Открыть параметры") { showSettingsTab() })
-            contentFrame.addView(empty)
+            showNoFolderSelectedState()
             return
         }
 
         val list = try {
-            saf.loadTests(rootUri)
+            withFolderAccess(rootUri) { saf.loadTests(rootUri) } ?: run {
+                showNoFolderSelectedState()
+                return
+            }
         } catch (e: Exception) {
             showMessage("Ошибка", "Не удалось прочитать папку test: ${e.safeMessage()}")
             TestLoadResult(emptyList(), listOf("Не удалось прочитать папку test"))
@@ -233,6 +242,16 @@ class MainActivity : Activity() {
         contentFrame.addView(scroll)
     }
 
+    private fun showNoFolderSelectedState() {
+        contentFrame.removeAllViews()
+        val empty = verticalContainer()
+        empty.gravity = Gravity.CENTER
+        empty.addView(text("Папка с вопросами не выбрана", 18, true))
+        empty.addView(spacer(12))
+        empty.addView(button("Открыть параметры") { showSettingsTab() })
+        contentFrame.addView(empty)
+    }
+
     private fun showSettingsTab() {
         runningTestFile = null
         activeScreen = Screen.SETTINGS
@@ -251,7 +270,9 @@ class MainActivity : Activity() {
         box.addView(spacer(8))
 
         val uri = savedFolderUri()
-        val folderName = uri?.let { saf.displayNameForTree(it) }
+        val folderName = uri?.let { folderUri ->
+            withFolderAccess(folderUri) { saf.displayNameForTree(folderUri) }
+        }
         box.addView(text(if (folderName != null) "Выбрана папка: $folderName" else "Папка не выбрана", 16, false))
         box.addView(spacer(16))
 
@@ -288,7 +309,10 @@ class MainActivity : Activity() {
             return
         }
         try {
-            val files = saf.listDocxFiles(uri)
+            val files = withFolderAccess(uri) { saf.listDocxFiles(uri) } ?: run {
+                showSettingsTab()
+                return
+            }
             val message = if (files.isEmpty()) {
                 "В выбранной папке нет файлов .docx."
             } else {
@@ -306,7 +330,12 @@ class MainActivity : Activity() {
             showMessage("Папка не выбрана", "Сначала выберите папку с вопросами.")
             return
         }
-        val files = try { saf.listDocxFiles(uri) } catch (e: Exception) {
+        val files = try {
+            withFolderAccess(uri) { saf.listDocxFiles(uri) } ?: run {
+                showSettingsTab()
+                return
+            }
+        } catch (e: Exception) {
             showMessage("Ошибка", "Не удалось прочитать папку: ${e.safeMessage()}")
             return
         }
@@ -413,6 +442,7 @@ class MainActivity : Activity() {
         showBusy("Создание теста…")
         thread {
             val result = try {
+                if (!hasPersistedFolderPermission(rootUri)) throw SecurityException()
                 val parsed = mutableListOf<SourceQuestions>()
                 val warnings = mutableListOf<String>()
                 for (source in sources) {
@@ -435,12 +465,18 @@ class MainActivity : Activity() {
                 saf.createTestFile(rootUri, fileName, template.toJson().toString(2))
                 if (requestedCount > totalAvailable) warnings.add(0, "Запрошено вопросов: $requestedCount, доступно корректных: $totalAvailable. Тест создан на $finalCount вопросов.")
                 SuccessCreate(warnings)
+            } catch (e: SecurityException) {
+                LostFolderAccess
             } catch (e: Exception) {
                 ErrorResult(e.safeMessage())
             }
             runOnUiThread {
                 hideBusy()
                 when (result) {
+                    LostFolderAccess -> {
+                        handleLostFolderAccess()
+                        showSettingsTab()
+                    }
                     is SuccessCreate -> {
                         if (result.warnings.isNotEmpty()) {
                             AlertDialog.Builder(this)
@@ -544,6 +580,9 @@ class MainActivity : Activity() {
                 try {
                     saf.writeText(file.uri, file.template.toJson().toString(2))
                     showTestsTab()
+                } catch (e: SecurityException) {
+                    handleLostFolderAccess()
+                    showTestsTab()
                 } catch (e: Exception) {
                     showMessage("Ошибка", "Не удалось сохранить тест: ${e.safeMessage()}")
                 }
@@ -560,6 +599,9 @@ class MainActivity : Activity() {
                 try {
                     savedFolderUri()?.let { saf.deleteAssetsForTest(it, file.fileName) }
                     DocumentsContract.deleteDocument(contentResolver, file.uri)
+                    showTestsTab()
+                } catch (e: SecurityException) {
+                    handleLostFolderAccess()
                     showTestsTab()
                 } catch (e: Exception) {
                     showMessage("Ошибка", "Не удалось удалить тест: ${e.safeMessage()}")
@@ -611,6 +653,7 @@ class MainActivity : Activity() {
         showBusy("Подготовка попытки…")
         thread {
             val result = try {
+                if (!hasPersistedFolderPermission(rootUri)) throw SecurityException()
                 val missing = mutableListOf<String>()
                 val parsedSources = mutableListOf<SourceQuestions>()
                 for (source in template.sourceFiles) {
@@ -639,12 +682,18 @@ class MainActivity : Activity() {
                 )
                 saf.writeText(file.uri, template.toJson().toString(2))
                 SuccessOpen
+            } catch (e: SecurityException) {
+                LostFolderAccess
             } catch (e: Exception) {
                 ErrorResult(e.safeMessage())
             }
             runOnUiThread {
                 hideBusy()
                 when (result) {
+                    LostFolderAccess -> {
+                        handleLostFolderAccess()
+                        showTestsTab()
+                    }
                     SuccessOpen -> {
                         runningTestFile = file
                         showRunScreen(file)
@@ -699,7 +748,7 @@ class MainActivity : Activity() {
                     if (question.status == AnswerStatus.UNANSWERED.value && question.skipped) {
                         attempt.currentIndex = index
                         attempt.feedbackPending = false
-                        persistRunning(file)
+                        if (!persistRunning(file)) return@setOnClickListener
                         showRunScreen(file)
                     }
                 }
@@ -934,12 +983,12 @@ class MainActivity : Activity() {
             if (correct) {
                 current.status = AnswerStatus.CORRECT.value
                 attempt.feedbackPending = false
-                persistRunning(file)
+                if (!persistRunning(file)) return@setOnClickListener
                 moveAfterAnswerOrFinish(file)
             } else {
                 current.status = AnswerStatus.INCORRECT.value
                 attempt.feedbackPending = true
-                persistRunning(file)
+                if (!persistRunning(file)) return@setOnClickListener
                 showRunScreen(file)
             }
         }
@@ -952,7 +1001,7 @@ class MainActivity : Activity() {
         }
         nextButton.setOnClickListener {
             attempt.feedbackPending = false
-            persistRunning(file)
+            if (!persistRunning(file)) return@setOnClickListener
             moveAfterAnswerOrFinish(file)
         }
         updateAnswerButton()
@@ -978,7 +1027,7 @@ class MainActivity : Activity() {
             return
         }
         attempt.currentIndex = next
-        persistRunning(file)
+        if (!persistRunning(file)) return
         showRunScreen(file)
     }
 
@@ -993,7 +1042,14 @@ class MainActivity : Activity() {
         test.attempts += result
         test.activeAttempt = null
         savedFolderUri()?.let { saf.deleteAttemptAssets(it, file.fileName) }
-        try { saf.writeText(file.uri, test.toJson().toString(2)) } catch (_: Exception) { }
+        try {
+            saf.writeText(file.uri, test.toJson().toString(2))
+        } catch (e: SecurityException) {
+            handleLostFolderAccess()
+            showTestsTab()
+            return
+        } catch (_: Exception) {
+        }
         AlertDialog.Builder(this)
             .setTitle("Тест завершен")
             .setMessage("Всего вопросов: $total\nПравильно: $correct\nНеправильно: $wrong\nРезультат: $percent%")
@@ -1010,10 +1066,17 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun persistRunning(file: TestFile) {
-        try { saf.writeText(file.uri, file.template.toJson().toString(2)) } catch (e: Exception) {
+    private fun persistRunning(file: TestFile): Boolean {
+        try {
+            saf.writeText(file.uri, file.template.toJson().toString(2))
+        } catch (e: SecurityException) {
+            handleLostFolderAccess()
+            showTestsTab()
+            return false
+        } catch (e: Exception) {
             Toast.makeText(this, "Не удалось сохранить состояние попытки", Toast.LENGTH_SHORT).show()
         }
+        return true
     }
 
     private fun setTabSelection(testsSelected: Boolean) {
@@ -1045,7 +1108,64 @@ class MainActivity : Activity() {
         busyDialog = null
     }
 
-    private fun savedFolderUri(): Uri? = prefs.getString(PREF_FOLDER_URI, null)?.let { runCatching { Uri.parse(it) }.getOrNull() }
+    private fun savedFolderUri(): Uri? {
+        val uri = rawSavedFolderUri() ?: return null
+        if (!hasPersistedFolderPermission(uri)) {
+            handleLostFolderAccess()
+            return null
+        }
+        return uri
+    }
+
+    private fun rawSavedFolderUri(): Uri? {
+        return prefs.getString(PREF_FOLDER_URI, null)?.let { runCatching { Uri.parse(it) }.getOrNull() }
+    }
+
+    private fun validateSavedFolderAccess(): Boolean {
+        val uri = rawSavedFolderUri() ?: return true
+        if (hasPersistedFolderPermission(uri)) return true
+        handleLostFolderAccess()
+        return false
+    }
+
+    private fun hasPersistedFolderPermission(uri: Uri): Boolean {
+        return contentResolver.persistedUriPermissions.any { permission ->
+            permission.uri == uri && permission.isReadPermission && permission.isWritePermission
+        }
+    }
+
+    private fun <T> withFolderAccess(rootUri: Uri, action: () -> T): T? {
+        if (!hasPersistedFolderPermission(rootUri)) {
+            handleLostFolderAccess()
+            return null
+        }
+        return try {
+            action()
+        } catch (e: SecurityException) {
+            handleLostFolderAccess()
+            null
+        }
+    }
+
+    private fun handleLostFolderAccess() {
+        prefs.edit().remove(PREF_FOLDER_URI).apply()
+        runOnUiThread {
+            runningTestFile = null
+            tabRow.visibility = View.VISIBLE
+            if (lostFolderAccessDialogVisible) return@runOnUiThread
+            lostFolderAccessDialogVisible = true
+            AlertDialog.Builder(this)
+                .setTitle("Доступ к папке потерян")
+                .setMessage(LOST_FOLDER_ACCESS_MESSAGE)
+                .setPositiveButton("Выбрать папку") { _, _ -> openFolderPicker() }
+                .setNegativeButton("Позже", null)
+                .create()
+                .apply {
+                    setOnDismissListener { lostFolderAccessDialogVisible = false }
+                    show()
+                }
+        }
+    }
 
     private fun isFreeTextCorrect(userAnswer: String, correctAnswers: List<String>, strict: Boolean): Boolean {
         return if (strict) {
@@ -1084,7 +1204,11 @@ class MainActivity : Activity() {
         adjustViewBounds = true
         maxHeight = dp(360)
         scaleType = ImageView.ScaleType.FIT_CENTER
-        setImageURI(Uri.parse(ref.uri))
+        try {
+            setImageURI(Uri.parse(ref.uri))
+        } catch (e: SecurityException) {
+            handleLostFolderAccess()
+        }
         background = rounded(inputColor(), dp(1), borderColor(), dp(8))
         setPadding(dp(4), dp(4), dp(4), dp(4))
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -1096,7 +1220,11 @@ class MainActivity : Activity() {
         val img = ImageView(this).apply {
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
-            setImageURI(Uri.parse(ref.uri))
+            try {
+                setImageURI(Uri.parse(ref.uri))
+            } catch (e: SecurityException) {
+                handleLostFolderAccess()
+            }
             setPadding(dp(8), dp(8), dp(8), dp(8))
         }
         scroll.addView(img)
@@ -1147,19 +1275,15 @@ class MainActivity : Activity() {
     }
 
     private fun showUpdatesDialogIfNeeded() {
-        if (prefs.getBoolean(PREF_CHANGELOG_1_1_0_SHOWN, false)) return
-        prefs.edit().putBoolean(PREF_CHANGELOG_1_1_0_SHOWN, true).apply()
+        if (prefs.getBoolean(PREF_CHANGELOG_1_1_1_SHOWN, false)) return
+        prefs.edit().putBoolean(PREF_CHANGELOG_1_1_1_SHOWN, true).apply()
         AlertDialog.Builder(this)
-            .setTitle("Что нового в версии 1.1.0")
+            .setTitle("Что нового в версии 1.1.1")
             .setMessage(
                 """
-                Добавлено:
-                - Проверка обновлений внутри приложения.
-                - Загрузка и запуск установки новой версии из приложения.
-                - Автоматическое добавление .nomedia в папки с изображениями, чтобы картинки тестов не попадали в галерею.
-
                 Исправлено:
-                - Улучшена работа с папками изображений тестов.
+                - Улучшена обработка доступа к выбранной папке с вопросами.
+                - Если Android отозвал доступ к папке, приложение теперь показывает понятное сообщение и предлагает выбрать папку заново.
                 """.trimIndent()
             )
             .setPositiveButton("ОК", null)
@@ -1566,6 +1690,8 @@ class SafStore(private val activity: Activity) {
                 val text = readText(file.uri)
                 val template = TestTemplate.fromJson(JSONObject(text))
                 tests += TestFile(file.name, file.uri, template)
+            } catch (e: SecurityException) {
+                throw e
             } catch (_: Exception) {
                 warnings += "Некоторые тесты не удалось загрузить: ${file.name}"
             }
@@ -1654,23 +1780,29 @@ class SafStore(private val activity: Activity) {
     }
 
     private fun ensureNoMediaInExistingAssets(testDir: Uri) {
-        runCatching {
+        try {
             listChildren(testDir)
                 .filter { it.isDirectory && it.name.endsWith("_assets") }
                 .forEach { assets ->
                     ensureNoMedia(assets.uri)
                     listChildren(assets.uri).filter { it.isDirectory }.forEach { child -> ensureNoMedia(child.uri) }
                 }
+        } catch (e: SecurityException) {
+            throw e
+        } catch (_: Exception) {
         }
     }
 
     private fun ensureNoMedia(dir: Uri) {
-        runCatching {
+        try {
             val exists = listChildren(dir).any { !it.isDirectory && it.name == ".nomedia" }
             if (!exists) {
                 val uri = DocumentsContract.createDocument(resolver, dir, "application/octet-stream", ".nomedia")
                 if (uri != null) resolver.openOutputStream(uri, "wt")?.use { }
             }
+        } catch (e: SecurityException) {
+            throw e
+        } catch (_: Exception) {
         }
     }
 
@@ -2160,6 +2292,7 @@ data class DocumentInfo(val name: String, val documentId: String, val uri: Uri, 
 data class TestFile(val fileName: String, val uri: Uri, val template: TestTemplate)
 data class TestLoadResult(val tests: List<TestFile>, val warnings: List<String>)
 object SuccessOpen
+object LostFolderAccess
 class SuccessCreate(val warnings: List<String>)
 class ErrorResult(val message: String)
 class UserVisibleException(message: String) : Exception(message)
