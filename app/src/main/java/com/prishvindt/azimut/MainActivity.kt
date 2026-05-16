@@ -54,7 +54,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.InputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -115,7 +117,7 @@ class MainActivity : Activity() {
         private const val UPDATE_APK_FILE_NAME = "Azimut-update.apk"
         private const val APK_MIME = "application/vnd.android.package-archive"
         private const val ONE_DAY_MILLIS = 24L * 60L * 60L * 1000L
-        private const val LOST_FOLDER_ACCESS_MESSAGE = "Доступ к папке потерян. Выберите папку с вопросами заново."
+        private const val LOST_FOLDER_ACCESS_MESSAGE = "Папка с файлами утеряна. Проверьте правильность пути к папке."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -185,7 +187,11 @@ class MainActivity : Activity() {
             } catch (e: SecurityException) {
                 showMessage("Доступ не сохранен", LOST_FOLDER_ACCESS_MESSAGE)
                 return
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (isLostFolderError(e)) {
+                    showMessage("Доступ не сохранен", LOST_FOLDER_ACCESS_MESSAGE)
+                    return
+                }
             }
             prefs.edit().putString(PREF_FOLDER_URI, uri.toString()).apply()
             if (!hasPersistedFolderPermission(uri)) {
@@ -217,6 +223,10 @@ class MainActivity : Activity() {
                 return
             }
         } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showNoFolderSelectedState()
+                return
+            }
             showMessage("Ошибка", "Не удалось прочитать папку test: ${e.safeMessage()}")
             TestLoadResult(emptyList(), listOf("Не удалось прочитать папку test"))
         }
@@ -320,6 +330,10 @@ class MainActivity : Activity() {
             }
             showMessage("Список файлов", message)
         } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showSettingsTab()
+                return
+            }
             showMessage("Ошибка", "Не удалось обновить список файлов: ${e.safeMessage()}")
         }
     }
@@ -336,6 +350,10 @@ class MainActivity : Activity() {
                 return
             }
         } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showSettingsTab()
+                return
+            }
             showMessage("Ошибка", "Не удалось прочитать папку: ${e.safeMessage()}")
             return
         }
@@ -465,10 +483,8 @@ class MainActivity : Activity() {
                 saf.createTestFile(rootUri, fileName, template.toJson().toString(2))
                 if (requestedCount > totalAvailable) warnings.add(0, "Запрошено вопросов: $requestedCount, доступно корректных: $totalAvailable. Тест создан на $finalCount вопросов.")
                 SuccessCreate(warnings)
-            } catch (e: SecurityException) {
-                LostFolderAccess
             } catch (e: Exception) {
-                ErrorResult(e.safeMessage())
+                if (isLostFolderError(e)) LostFolderAccess else ErrorResult(e.safeMessage())
             }
             runOnUiThread {
                 hideBusy()
@@ -580,11 +596,12 @@ class MainActivity : Activity() {
                 try {
                     saf.writeText(file.uri, file.template.toJson().toString(2))
                     showTestsTab()
-                } catch (e: SecurityException) {
-                    handleLostFolderAccess()
-                    showTestsTab()
                 } catch (e: Exception) {
-                    showMessage("Ошибка", "Не удалось сохранить тест: ${e.safeMessage()}")
+                    if (handleLostFolderError(e)) {
+                        showTestsTab()
+                    } else {
+                        showMessage("Ошибка", "Не удалось сохранить тест: ${e.safeMessage()}")
+                    }
                 }
             }
             .show()
@@ -600,11 +617,12 @@ class MainActivity : Activity() {
                     savedFolderUri()?.let { saf.deleteAssetsForTest(it, file.fileName) }
                     DocumentsContract.deleteDocument(contentResolver, file.uri)
                     showTestsTab()
-                } catch (e: SecurityException) {
-                    handleLostFolderAccess()
-                    showTestsTab()
                 } catch (e: Exception) {
-                    showMessage("Ошибка", "Не удалось удалить тест: ${e.safeMessage()}")
+                    if (handleLostFolderError(e)) {
+                        showTestsTab()
+                    } else {
+                        showMessage("Ошибка", "Не удалось удалить тест: ${e.safeMessage()}")
+                    }
                 }
             }
             .show()
@@ -682,10 +700,8 @@ class MainActivity : Activity() {
                 )
                 saf.writeText(file.uri, template.toJson().toString(2))
                 SuccessOpen
-            } catch (e: SecurityException) {
-                LostFolderAccess
             } catch (e: Exception) {
-                ErrorResult(e.safeMessage())
+                if (isLostFolderError(e)) LostFolderAccess else ErrorResult(e.safeMessage())
             }
             runOnUiThread {
                 hideBusy()
@@ -1044,11 +1060,11 @@ class MainActivity : Activity() {
         savedFolderUri()?.let { saf.deleteAttemptAssets(it, file.fileName) }
         try {
             saf.writeText(file.uri, test.toJson().toString(2))
-        } catch (e: SecurityException) {
-            handleLostFolderAccess()
-            showTestsTab()
-            return
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showTestsTab()
+                return
+            }
         }
         AlertDialog.Builder(this)
             .setTitle("Тест завершен")
@@ -1069,12 +1085,13 @@ class MainActivity : Activity() {
     private fun persistRunning(file: TestFile): Boolean {
         try {
             saf.writeText(file.uri, file.template.toJson().toString(2))
-        } catch (e: SecurityException) {
-            handleLostFolderAccess()
-            showTestsTab()
-            return false
         } catch (e: Exception) {
-            Toast.makeText(this, "Не удалось сохранить состояние попытки", Toast.LENGTH_SHORT).show()
+            if (handleLostFolderError(e)) {
+                showTestsTab()
+                return false
+            } else {
+                Toast.makeText(this, "Не удалось сохранить состояние попытки", Toast.LENGTH_SHORT).show()
+            }
         }
         return true
     }
@@ -1141,10 +1158,15 @@ class MainActivity : Activity() {
         }
         return try {
             action()
-        } catch (e: SecurityException) {
-            handleLostFolderAccess()
-            null
+        } catch (e: Exception) {
+            if (handleLostFolderError(e)) null else throw e
         }
+    }
+
+    private fun handleLostFolderError(error: Throwable): Boolean {
+        if (!isLostFolderError(error)) return false
+        handleLostFolderAccess()
+        return true
     }
 
     private fun handleLostFolderAccess() {
@@ -1155,7 +1177,7 @@ class MainActivity : Activity() {
             if (lostFolderAccessDialogVisible) return@runOnUiThread
             lostFolderAccessDialogVisible = true
             AlertDialog.Builder(this)
-                .setTitle("Доступ к папке потерян")
+                .setTitle("Папка с файлами утеряна")
                 .setMessage(LOST_FOLDER_ACCESS_MESSAGE)
                 .setPositiveButton("Выбрать папку") { _, _ -> openFolderPicker() }
                 .setNegativeButton("Позже", null)
@@ -1206,8 +1228,8 @@ class MainActivity : Activity() {
         scaleType = ImageView.ScaleType.FIT_CENTER
         try {
             setImageURI(Uri.parse(ref.uri))
-        } catch (e: SecurityException) {
-            handleLostFolderAccess()
+        } catch (e: Exception) {
+            handleLostFolderError(e)
         }
         background = rounded(inputColor(), dp(1), borderColor(), dp(8))
         setPadding(dp(4), dp(4), dp(4), dp(4))
@@ -1222,8 +1244,8 @@ class MainActivity : Activity() {
             scaleType = ImageView.ScaleType.FIT_CENTER
             try {
                 setImageURI(Uri.parse(ref.uri))
-            } catch (e: SecurityException) {
-                handleLostFolderAccess()
+            } catch (e: Exception) {
+                handleLostFolderError(e)
             }
             setPadding(dp(8), dp(8), dp(8), dp(8))
         }
@@ -1672,6 +1694,24 @@ class MainActivity : Activity() {
     private enum class Screen { TESTS, SETTINGS }
 }
 
+private fun isLostFolderError(error: Throwable): Boolean {
+    var current: Throwable? = error
+    while (current != null) {
+        if (current is SecurityException ||
+            current is FileNotFoundException ||
+            current is IllegalArgumentException ||
+            current is IOException
+        ) {
+            return true
+        }
+        if (current.message?.contains("Missing file", ignoreCase = true) == true) {
+            return true
+        }
+        current = current.cause
+    }
+    return false
+}
+
 class SafStore(private val activity: Activity) {
     private val resolver: ContentResolver = activity.contentResolver
 
@@ -1698,7 +1738,8 @@ class SafStore(private val activity: Activity) {
                 tests += TestFile(file.name, file.uri, template)
             } catch (e: SecurityException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (isLostFolderError(e)) throw e
                 warnings += "Некоторые тесты не удалось загрузить: ${file.name}"
             }
         }
@@ -1708,7 +1749,7 @@ class SafStore(private val activity: Activity) {
     fun createTestFile(rootTreeUri: Uri, name: String, content: String): Uri {
         val testDir = ensureTestDir(rootTreeUri)
         val uri = DocumentsContract.createDocument(resolver, testDir, "application/json", name)
-            ?: throw UserVisibleException("Не удалось создать JSON-файл теста.")
+            ?: throw LostFolderAccessException()
         writeText(uri, content)
         return uri
     }
@@ -1720,7 +1761,7 @@ class SafStore(private val activity: Activity) {
         val existing = listChildren(assets).firstOrNull { it.isDirectory && it.name == "attempt" }
         if (existing != null) deleteDocumentTree(existing.uri)
         val attempt = DocumentsContract.createDocument(resolver, assets, DocumentsContract.Document.MIME_TYPE_DIR, "attempt")
-            ?: throw UserVisibleException("Не удалось создать папку изображений попытки.")
+            ?: throw LostFolderAccessException()
         ensureNoMedia(attempt)
         return attempt
     }
@@ -1741,20 +1782,20 @@ class SafStore(private val activity: Activity) {
         val normalized = normalizeImageData(image)
         val name = "img_${index}_${UUID.randomUUID().toString().take(8)}.${normalized.extension}"
         val uri = DocumentsContract.createDocument(resolver, parentDir, normalized.mime, name)
-            ?: throw UserVisibleException("Не удалось сохранить изображение вопроса.")
+            ?: throw LostFolderAccessException()
         resolver.openOutputStream(uri, "wt")?.use { it.write(normalized.bytes) }
-            ?: throw UserVisibleException("Нет доступа на запись изображения.")
+            ?: throw LostFolderAccessException()
         return ImageRef(uri.toString(), normalized.mime, name)
     }
 
     fun writeText(uri: Uri, content: String) {
         resolver.openOutputStream(uri, "wt")?.use { out -> out.write(content.toByteArray(Charsets.UTF_8)) }
-            ?: throw UserVisibleException("Нет доступа на запись.")
+            ?: throw LostFolderAccessException()
     }
 
     fun readText(uri: Uri): String {
         return resolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
-            ?: throw UserVisibleException("Нет доступа на чтение.")
+            ?: throw LostFolderAccessException()
     }
 
     fun findSourceFile(rootTreeUri: Uri, source: SourceFile): Uri? {
@@ -1774,7 +1815,7 @@ class SafStore(private val activity: Activity) {
             return existing.uri
         }
         val created = DocumentsContract.createDocument(resolver, testDir, DocumentsContract.Document.MIME_TYPE_DIR, name)
-            ?: throw UserVisibleException("Не удалось создать папку изображений теста.")
+            ?: throw LostFolderAccessException()
         ensureNoMedia(created)
         return created
     }
@@ -1795,7 +1836,8 @@ class SafStore(private val activity: Activity) {
                 }
         } catch (e: SecurityException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (isLostFolderError(e)) throw e
         }
     }
 
@@ -1808,7 +1850,8 @@ class SafStore(private val activity: Activity) {
             }
         } catch (e: SecurityException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (isLostFolderError(e)) throw e
         }
     }
 
@@ -1848,7 +1891,7 @@ class SafStore(private val activity: Activity) {
         val existing = listChildren(root).firstOrNull { it.isDirectory && it.name == "test" }
         if (existing != null) return existing.uri
         return DocumentsContract.createDocument(resolver, root, DocumentsContract.Document.MIME_TYPE_DIR, "test")
-            ?: throw UserVisibleException("Не удалось создать подпапку test.")
+            ?: throw LostFolderAccessException()
     }
 
     private fun rootDocumentUri(treeUri: Uri): Uri {
@@ -2302,6 +2345,7 @@ object LostFolderAccess
 class SuccessCreate(val warnings: List<String>)
 class ErrorResult(val message: String)
 class UserVisibleException(message: String) : Exception(message)
+class LostFolderAccessException : IOException("Missing file")
 
 fun JSONArray?.toStringList(): List<String> {
     if (this == null) return emptyList()
@@ -2341,6 +2385,6 @@ fun mimeForImageExtension(ext: String): String? = when (ext.lowercase(Locale.ROO
 
 fun Exception.safeMessage(): String = message ?: "Неизвестная ошибка"
 inline fun <T> InputStream?.useRequired(block: (InputStream) -> T): T {
-    val stream = this ?: throw UserVisibleException("Нет доступа на чтение файла.")
+    val stream = this ?: throw LostFolderAccessException()
     return stream.use(block)
 }
