@@ -5,23 +5,18 @@ import android.app.DownloadManager
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.app.AlertDialog
-import android.content.ContentResolver
 import android.content.Context
 import android.content.IntentFilter
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Configuration
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.DocumentsContract
-import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
 import android.text.TextUtils
@@ -49,18 +44,6 @@ import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
-import org.apache.poi.xwpf.usermodel.XWPFDocument
-import org.apache.poi.xwpf.usermodel.XWPFParagraph
-import org.apache.poi.xwpf.usermodel.XWPFTableCell
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.FileNotFoundException
-import java.io.InputStream
-import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -72,6 +55,7 @@ import kotlin.random.Random
 class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var saf: SafStore
+    private lateinit var updateManager: UpdateManager
     private lateinit var contentFrame: FrameLayout
     private lateinit var updateArea: LinearLayout
     private lateinit var tabRow: LinearLayout
@@ -87,20 +71,16 @@ class MainActivity : Activity() {
     private var availableUpdate: UpdateInfo? = null
     private var updateDismissedThisRun = false
     private var updateExpanded = false
-    private var downloadInProgress = false
     private var downloadFailureCount = 0
-    private var pendingInstallAfterPermission = false
-    private var updateDownloadId: Long = -1L
     private var lostFolderAccessDialogVisible = false
 
     private val updateDownloadReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
             val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-            val expectedId = if (updateDownloadId > 0L) updateDownloadId else prefs.getLong(PREF_LAST_DOWNLOAD_ID, -1L)
-            if (id <= 0L || id != expectedId) return
-            downloadInProgress = false
-            if (isDownloadSuccessful(id)) {
+            if (!updateManager.isExpectedDownloadComplete(id)) return
+            updateManager.markDownloadComplete()
+            if (updateManager.isDownloadSuccessful(id)) {
                 downloadFailureCount = 0
                 Toast.makeText(this@MainActivity, "Обновление скачано", Toast.LENGTH_SHORT).show()
                 startInstallDownloadedUpdate()
@@ -116,13 +96,6 @@ class MainActivity : Activity() {
         private const val PREF_FOLDER_URI = "question_folder_uri"
         private const val PREF_THEME = "theme_mode"
         private const val PREF_CHANGELOG_1_2_0_SHOWN = "updates_1_2_0_shown"
-        private const val PREF_LAST_UPDATE_CHECK = "last_update_check_millis"
-        private const val PREF_LAST_DOWNLOAD_ID = "last_update_download_id"
-        private const val PREF_PENDING_INSTALL_AFTER_PERMISSION = "pending_install_after_permission"
-        private const val UPDATE_JSON_URL = "https://raw.githubusercontent.com/prishvindt/Azimut/main/update.json"
-        private const val UPDATE_APK_FILE_NAME = "Azimut-update.apk"
-        private const val APK_MIME = "application/vnd.android.package-archive"
-        private const val ONE_DAY_MILLIS = 24L * 60L * 60L * 1000L
         private const val LOST_FOLDER_ACCESS_MESSAGE = "Папка с файлами утеряна. Проверьте правильность пути к папке."
     }
 
@@ -135,6 +108,7 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
 
         saf = SafStore(this)
+        updateManager = UpdateManager(this, prefs)
         contentFrame = findViewById(R.id.contentFrame)
         updateArea = findViewById(R.id.updateArea)
         tabRow = findViewById(R.id.tabRow)
@@ -161,13 +135,14 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        if (pendingInstallAfterPermission || prefs.getBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, false)) {
-            if (canRequestPackageInstalls()) {
-                pendingInstallAfterPermission = false
-                prefs.edit().putBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, false).apply()
-                startInstallDownloadedUpdate()
-            }
-        }
+        updateManager.installPendingAfterPermission(
+            onFileNotFound = { Toast.makeText(this, "Файл обновления не найден", Toast.LENGTH_SHORT).show() },
+            onPermissionRequired = {
+                Toast.makeText(this, "Разрешите установку обновлений для приложения «Азимут», затем нажмите обновление ещё раз.", Toast.LENGTH_LONG).show()
+            },
+            onLaunchFailed = { Toast.makeText(this, "Не удалось открыть установку обновления", Toast.LENGTH_LONG).show() },
+            onDebugDisabled = { Toast.makeText(this, "Проверка обновлений отключена в debug-версии.", Toast.LENGTH_SHORT).show() }
+        )
     }
 
     override fun onDestroy() {
@@ -1483,59 +1458,25 @@ class MainActivity : Activity() {
     }
 
     private fun checkForUpdates(force: Boolean) {
-        if (BuildConfig.DEBUG) {
-            if (force) {
-                Toast.makeText(this, "Проверка обновлений отключена в debug-версии.", Toast.LENGTH_SHORT).show()
+        updateManager.checkForUpdates(
+            force = force,
+            onUpdateAvailable = { info ->
+                availableUpdate = info
+                updateDismissedThisRun = false
+                updateExpanded = false
+                renderUpdateArea()
+                if (force) Toast.makeText(this, "Доступна новая версия", Toast.LENGTH_SHORT).show()
+            },
+            onNoUpdate = {
+                if (force) Toast.makeText(this, "Установлена актуальная версия", Toast.LENGTH_SHORT).show()
+            },
+            onError = {
+                if (force) Toast.makeText(this, "Не удалось проверить обновления", Toast.LENGTH_SHORT).show()
+            },
+            onDebugDisabled = {
+                if (force) Toast.makeText(this, "Проверка обновлений отключена в debug-версии.", Toast.LENGTH_SHORT).show()
             }
-            return
-        }
-        if (!force) {
-            val lastCheck = prefs.getLong(PREF_LAST_UPDATE_CHECK, 0L)
-            if (System.currentTimeMillis() - lastCheck < ONE_DAY_MILLIS) return
-        }
-        thread {
-            var failed = false
-            val result = try {
-                val info = fetchUpdateInfo()
-                if (!force) prefs.edit().putLong(PREF_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply()
-                info
-            } catch (_: Exception) {
-                failed = true
-                if (!force) prefs.edit().putLong(PREF_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply()
-                null
-            }
-            runOnUiThread {
-                if (result != null && result.versionCode > BuildConfig.VERSION_CODE && result.apkUrl.isNotBlank()) {
-                    availableUpdate = result
-                    updateDismissedThisRun = false
-                    updateExpanded = false
-                    renderUpdateArea()
-                    if (force) Toast.makeText(this, "Доступна новая версия", Toast.LENGTH_SHORT).show()
-                } else if (force && failed) {
-                    Toast.makeText(this, "Не удалось проверить обновления", Toast.LENGTH_SHORT).show()
-                } else if (force) {
-                    Toast.makeText(this, "Установлена актуальная версия", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
-
-    private fun fetchUpdateInfo(): UpdateInfo {
-        val connection = (URL(UPDATE_JSON_URL).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 8000
-            readTimeout = 8000
-            requestMethod = "GET"
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("Cache-Control", "no-cache")
-        }
-        return try {
-            val code = connection.responseCode
-            if (code !in 200..299) throw UserVisibleException("Не удалось проверить обновления")
-            val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            UpdateInfo.fromJson(JSONObject(body))
-        } finally {
-            connection.disconnect()
-        }
+        )
     }
 
     private fun renderUpdateArea() {
@@ -1640,96 +1581,24 @@ class MainActivity : Activity() {
     }
 
     private fun startUpdateDownload(info: UpdateInfo) {
-        if (downloadInProgress || isDownloadRunning()) {
-            Toast.makeText(this, "Обновление уже скачивается", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-        if (dir != null) File(dir, UPDATE_APK_FILE_NAME).delete()
-        val request = DownloadManager.Request(Uri.parse(info.apkUrl)).apply {
-            setTitle("Азимут ${info.versionName}")
-            setDescription("Скачивание обновления")
-            setMimeType(APK_MIME)
-            setAllowedOverMetered(true)
-            setAllowedOverRoaming(true)
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalFilesDir(this@MainActivity, Environment.DIRECTORY_DOWNLOADS, UPDATE_APK_FILE_NAME)
-        }
-        try {
-            val id = manager.enqueue(request)
-            updateDownloadId = id
-            downloadInProgress = true
-            prefs.edit().putLong(PREF_LAST_DOWNLOAD_ID, id).apply()
-            Toast.makeText(this, "Скачивание обновления началось", Toast.LENGTH_SHORT).show()
-        } catch (_: Exception) {
-            downloadInProgress = false
-            showDownloadFailedToast()
-        }
-    }
-
-    private fun isDownloadRunning(): Boolean {
-        val id = prefs.getLong(PREF_LAST_DOWNLOAD_ID, -1L)
-        if (id <= 0L) return false
-        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val cursor = manager.query(DownloadManager.Query().setFilterById(id)) ?: return false
-        cursor.use {
-            if (!it.moveToFirst()) return false
-            val status = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-            return status == DownloadManager.STATUS_PENDING || status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PAUSED
-        }
-    }
-
-    private fun isDownloadSuccessful(id: Long): Boolean {
-        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val cursor = manager.query(DownloadManager.Query().setFilterById(id)) ?: return false
-        cursor.use {
-            if (!it.moveToFirst()) return false
-            val status = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-            return status == DownloadManager.STATUS_SUCCESSFUL
-        }
+        updateManager.startDownload(
+            info = info,
+            onAlreadyDownloading = { Toast.makeText(this, "Обновление уже скачивается", Toast.LENGTH_SHORT).show() },
+            onStarted = { Toast.makeText(this, "Скачивание обновления началось", Toast.LENGTH_SHORT).show() },
+            onFailed = { showDownloadFailedToast() },
+            onDebugDisabled = { Toast.makeText(this, "Проверка обновлений отключена в debug-версии.", Toast.LENGTH_SHORT).show() }
+        )
     }
 
     private fun startInstallDownloadedUpdate() {
-        val id = prefs.getLong(PREF_LAST_DOWNLOAD_ID, -1L)
-        if (id <= 0L) {
-            Toast.makeText(this, "Файл обновления не найден", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (!canRequestPackageInstalls()) {
-            pendingInstallAfterPermission = true
-            prefs.edit().putBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, true).apply()
-            Toast.makeText(this, "Разрешите установку обновлений для приложения «Азимут», затем нажмите обновление ещё раз.", Toast.LENGTH_LONG).show()
-            openInstallPermissionSettings()
-            return
-        }
-        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val uri = manager.getUriForDownloadedFile(id)
-        if (uri == null) {
-            Toast.makeText(this, "Файл обновления не найден", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, APK_MIME)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            startActivity(intent)
-        } catch (_: Exception) {
-            Toast.makeText(this, "Не удалось открыть установку обновления", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun canRequestPackageInstalls(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) packageManager.canRequestPackageInstalls() else true
-    }
-
-    private fun openInstallPermissionSettings() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
-            startActivity(intent)
-        }
+        updateManager.startInstallDownloadedUpdate(
+            onFileNotFound = { Toast.makeText(this, "Файл обновления не найден", Toast.LENGTH_SHORT).show() },
+            onPermissionRequired = {
+                Toast.makeText(this, "Разрешите установку обновлений для приложения «Азимут», затем нажмите обновление ещё раз.", Toast.LENGTH_LONG).show()
+            },
+            onLaunchFailed = { Toast.makeText(this, "Не удалось открыть установку обновления", Toast.LENGTH_LONG).show() },
+            onDebugDisabled = { Toast.makeText(this, "Проверка обновлений отключена в debug-версии.", Toast.LENGTH_SHORT).show() }
+        )
     }
 
     private fun showDownloadFailedToast() {
@@ -2041,754 +1910,4 @@ class MainActivity : Activity() {
     private fun formatDate(ms: Long): String = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale("ru", "RU")).format(Date(ms))
 
     private enum class Screen { CARDS, TESTS, SETTINGS, STATISTICS }
-}
-
-private fun isLostFolderError(error: Throwable): Boolean {
-    var current: Throwable? = error
-    while (current != null) {
-        if (current is SecurityException ||
-            current is FileNotFoundException ||
-            current is IllegalArgumentException ||
-            current is IOException
-        ) {
-            return true
-        }
-        if (current.message?.contains("Missing file", ignoreCase = true) == true) {
-            return true
-        }
-        current = current.cause
-    }
-    return false
-}
-
-class SafStore(private val activity: Activity) {
-    private val resolver: ContentResolver = activity.contentResolver
-
-    companion object {
-        private val SERVICE_MIPMAP_DIRS = setOf(
-            "mipmap-mdpi",
-            "mipmap-hdpi",
-            "mipmap-xhdpi",
-            "mipmap-xxhdpi",
-            "mipmap-xxxhdpi"
-        )
-    }
-
-    fun displayNameForTree(treeUri: Uri): String {
-        return queryName(rootDocumentUri(treeUri)) ?: DocumentsContract.getTreeDocumentId(treeUri).substringAfterLast(':')
-    }
-
-    fun listDocxFiles(rootTreeUri: Uri): List<DocumentInfo> {
-        ensureNoMediaInServiceMipmapDirs(rootTreeUri)
-        return listChildren(rootDocumentUri(rootTreeUri))
-            .filter { !it.isDirectory && it.name.endsWith(".docx", ignoreCase = true) && !it.name.startsWith("~$") }
-            .sortedBy { it.name.lowercase(Locale.ROOT) }
-    }
-
-    fun loadTests(rootTreeUri: Uri): TestLoadResult {
-        ensureNoMediaInServiceMipmapDirs(rootTreeUri)
-        val testDir = ensureTestDir(rootTreeUri)
-        ensureNoMediaInExistingAssets(testDir)
-        val warnings = mutableListOf<String>()
-        val tests = mutableListOf<TestFile>()
-        val files = listChildren(testDir).filter { !it.isDirectory && it.name.endsWith(".json", true) }
-        for (file in files) {
-            try {
-                val text = readText(file.uri)
-                val template = TestTemplate.fromJson(JSONObject(text))
-                tests += TestFile(file.name, file.uri, template)
-            } catch (e: SecurityException) {
-                throw e
-            } catch (e: Exception) {
-                if (isLostFolderError(e)) throw e
-                warnings += "Некоторые тесты не удалось загрузить: ${file.name}"
-            }
-        }
-        return TestLoadResult(tests.sortedBy { it.template.title.lowercase(Locale.ROOT) }, warnings)
-    }
-
-    fun loadExistingTests(rootTreeUri: Uri): TestLoadResult {
-        ensureNoMediaInServiceMipmapDirs(rootTreeUri)
-        val testDir = findTestDir(rootTreeUri) ?: return TestLoadResult(emptyList(), emptyList())
-        val warnings = mutableListOf<String>()
-        val tests = mutableListOf<TestFile>()
-        val files = listChildren(testDir).filter { !it.isDirectory && it.name.endsWith(".json", true) }
-        for (file in files) {
-            try {
-                val text = readText(file.uri)
-                val template = TestTemplate.fromJson(JSONObject(text))
-                tests += TestFile(file.name, file.uri, template)
-            } catch (e: SecurityException) {
-                throw e
-            } catch (e: Exception) {
-                if (isLostFolderError(e)) throw e
-                warnings += "Некоторые тесты не удалось загрузить"
-            }
-        }
-        return TestLoadResult(tests.sortedBy { it.template.title.lowercase(Locale.ROOT) }, warnings.distinct())
-    }
-
-    fun ensureNoMediaInServiceMipmapDirs(rootTreeUri: Uri) {
-        val root = runCatching { rootDocumentUri(rootTreeUri) }.getOrNull() ?: return
-        ensureNoMediaInServiceMipmapDirsUnder(root)
-        runCatching { findTestDir(rootTreeUri) }.getOrNull()?.let { ensureNoMediaInServiceMipmapDirsUnder(it) }
-    }
-
-    fun createTestFile(rootTreeUri: Uri, name: String, content: String): Uri {
-        val testDir = ensureTestDir(rootTreeUri)
-        val uri = DocumentsContract.createDocument(resolver, testDir, "application/json", name)
-            ?: throw LostFolderAccessException()
-        writeText(uri, content)
-        return uri
-    }
-
-
-    fun resetAttemptAssets(rootTreeUri: Uri, testFileName: String): Uri {
-        val assets = ensureAssetsDir(rootTreeUri, testFileName)
-        ensureNoMedia(assets)
-        val existing = listChildren(assets).firstOrNull { it.isDirectory && it.name == "attempt" }
-        if (existing != null) deleteDocumentTree(existing.uri)
-        val attempt = DocumentsContract.createDocument(resolver, assets, DocumentsContract.Document.MIME_TYPE_DIR, "attempt")
-            ?: throw LostFolderAccessException()
-        ensureNoMedia(attempt)
-        return attempt
-    }
-
-    fun deleteAttemptAssets(rootTreeUri: Uri, testFileName: String) {
-        runCatching {
-            val assets = findAssetsDir(rootTreeUri, testFileName) ?: return
-            val attempt = listChildren(assets).firstOrNull { it.isDirectory && it.name == "attempt" } ?: return
-            deleteDocumentTree(attempt.uri)
-        }
-    }
-
-    fun deleteAssetsForTest(rootTreeUri: Uri, testFileName: String) {
-        runCatching { findAssetsDir(rootTreeUri, testFileName)?.let { deleteDocumentTree(it) } }
-    }
-
-    fun saveEmbeddedImage(parentDir: Uri, image: EmbeddedImage, index: Int): ImageRef {
-        val normalized = normalizeImageData(image)
-        val name = "img_${index}_${UUID.randomUUID().toString().take(8)}.${normalized.extension}"
-        val uri = DocumentsContract.createDocument(resolver, parentDir, normalized.mime, name)
-            ?: throw LostFolderAccessException()
-        resolver.openOutputStream(uri, "wt")?.use { it.write(normalized.bytes) }
-            ?: throw LostFolderAccessException()
-        return ImageRef(uri.toString(), normalized.mime, name)
-    }
-
-    fun writeText(uri: Uri, content: String) {
-        resolver.openOutputStream(uri, "wt")?.use { out -> out.write(content.toByteArray(Charsets.UTF_8)) }
-            ?: throw LostFolderAccessException()
-    }
-
-    fun readText(uri: Uri): String {
-        return resolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
-            ?: throw LostFolderAccessException()
-    }
-
-    fun findSourceFile(rootTreeUri: Uri, source: SourceFile): Uri? {
-        if (source.documentId.isNotBlank()) {
-            val byId = runCatching { DocumentsContract.buildDocumentUriUsingTree(rootTreeUri, source.documentId) }.getOrNull()
-            if (byId != null && documentExists(byId)) return byId
-        }
-        return listDocxFiles(rootTreeUri).firstOrNull { it.name == source.name }?.uri
-    }
-
-    private fun ensureAssetsDir(rootTreeUri: Uri, testFileName: String): Uri {
-        val testDir = ensureTestDir(rootTreeUri)
-        val name = testFileName.substringBeforeLast('.') + "_assets"
-        val existing = listChildren(testDir).firstOrNull { it.isDirectory && it.name == name }
-        if (existing != null) {
-            ensureNoMedia(existing.uri)
-            return existing.uri
-        }
-        val created = DocumentsContract.createDocument(resolver, testDir, DocumentsContract.Document.MIME_TYPE_DIR, name)
-            ?: throw LostFolderAccessException()
-        ensureNoMedia(created)
-        return created
-    }
-
-    private fun findAssetsDir(rootTreeUri: Uri, testFileName: String): Uri? {
-        val testDir = ensureTestDir(rootTreeUri)
-        val name = testFileName.substringBeforeLast('.') + "_assets"
-        return listChildren(testDir).firstOrNull { it.isDirectory && it.name == name }?.uri
-    }
-
-    private fun ensureNoMediaInExistingAssets(testDir: Uri) {
-        try {
-            listChildren(testDir)
-                .filter { it.isDirectory && it.name.endsWith("_assets") }
-                .forEach { assets ->
-                    ensureNoMedia(assets.uri)
-                    listChildren(assets.uri).filter { it.isDirectory }.forEach { child -> ensureNoMedia(child.uri) }
-                }
-        } catch (e: SecurityException) {
-            throw e
-        } catch (e: Exception) {
-            if (isLostFolderError(e)) throw e
-        }
-    }
-
-    private fun ensureNoMediaInServiceMipmapDirsUnder(parentDir: Uri) {
-        runCatching {
-            listChildren(parentDir)
-                .filter { it.isDirectory && it.name in SERVICE_MIPMAP_DIRS }
-                .forEach { ensureNoMediaQuietly(it.uri) }
-        }
-    }
-
-    private fun ensureNoMediaQuietly(dir: Uri) {
-        runCatching { ensureNoMedia(dir) }
-    }
-
-    private fun ensureNoMedia(dir: Uri) {
-        try {
-            val exists = listChildren(dir).any { !it.isDirectory && it.name == ".nomedia" }
-            if (!exists) {
-                val uri = DocumentsContract.createDocument(resolver, dir, "application/octet-stream", ".nomedia")
-                if (uri != null) resolver.openOutputStream(uri, "wt")?.use { }
-            }
-        } catch (e: SecurityException) {
-            throw e
-        } catch (e: Exception) {
-            if (isLostFolderError(e)) throw e
-        }
-    }
-
-    private fun deleteDocumentTree(uri: Uri) {
-        runCatching {
-            val children = listChildren(uri)
-            for (child in children) {
-                if (child.isDirectory) deleteDocumentTree(child.uri) else DocumentsContract.deleteDocument(resolver, child.uri)
-            }
-        }
-        DocumentsContract.deleteDocument(resolver, uri)
-    }
-
-    private data class NormalizedImage(val bytes: ByteArray, val extension: String, val mime: String)
-
-    private fun normalizeImageData(image: EmbeddedImage): NormalizedImage {
-        val bitmap = runCatching { BitmapFactory.decodeByteArray(image.bytes, 0, image.bytes.size) }.getOrNull()
-        if (bitmap == null) return NormalizedImage(image.bytes, image.extension, image.mime)
-        val maxSide = maxOf(bitmap.width, bitmap.height)
-        if (maxSide <= 1200) {
-            bitmap.recycle()
-            return NormalizedImage(image.bytes, image.extension, image.mime)
-        }
-        val scale = 1200f / maxSide.toFloat()
-        val newWidth = (bitmap.width * scale).roundToInt().coerceAtLeast(1)
-        val newHeight = (bitmap.height * scale).roundToInt().coerceAtLeast(1)
-        val scaled = Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
-        val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 90, out)
-        if (scaled != bitmap) scaled.recycle()
-        bitmap.recycle()
-        return NormalizedImage(out.toByteArray(), "jpg", "image/jpeg")
-    }
-
-    private fun ensureTestDir(rootTreeUri: Uri): Uri {
-        findTestDir(rootTreeUri)?.let { return it }
-        val root = rootDocumentUri(rootTreeUri)
-        return DocumentsContract.createDocument(resolver, root, DocumentsContract.Document.MIME_TYPE_DIR, "test")
-            ?: throw LostFolderAccessException()
-    }
-
-    private fun findTestDir(rootTreeUri: Uri): Uri? {
-        val root = rootDocumentUri(rootTreeUri)
-        return listChildren(root).firstOrNull { it.isDirectory && it.name == "test" }?.uri
-    }
-
-    private fun rootDocumentUri(treeUri: Uri): Uri {
-        val docId = DocumentsContract.getTreeDocumentId(treeUri)
-        return DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-    }
-
-    private fun listChildren(parentUri: Uri): List<DocumentInfo> {
-        val result = mutableListOf<DocumentInfo>()
-        val parentId = DocumentsContract.getDocumentId(parentUri)
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(parentUri, parentId)
-        val columns = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE
-        )
-        resolver.query(childrenUri, columns, null, null, null)?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-            while (cursor.moveToNext()) {
-                val id = cursor.getString(idCol)
-                val name = cursor.getString(nameCol) ?: "Без имени"
-                val mime = cursor.getString(mimeCol) ?: ""
-                val uri = DocumentsContract.buildDocumentUriUsingTree(parentUri, id)
-                result += DocumentInfo(name, id, uri, mime == DocumentsContract.Document.MIME_TYPE_DIR)
-            }
-        }
-        return result
-    }
-
-    private fun queryName(uri: Uri): String? {
-        val columns = arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-        return resolver.query(uri, columns, null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
-    }
-
-    private fun documentExists(uri: Uri): Boolean = runCatching {
-        resolver.query(uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { it.moveToFirst() } == true
-    }.getOrDefault(false)
-}
-
-class QuestionDocxParser {
-    fun parse(input: InputStream): ParseReport {
-        val questions = mutableListOf<ParsedQuestion>()
-        val skipped = mutableListOf<String>()
-        XWPFDocument(input).use { document ->
-            val tables = document.tables
-            for (table in tables) {
-                var current: RawQuestion? = null
-                fun flush() {
-                    val raw = current ?: return
-                    val validation = raw.toParsedQuestion()
-                    if (validation.question != null) questions += validation.question else skipped += validation.reason ?: "Некорректный вопрос"
-                    current = null
-                }
-                for (row in table.rows) {
-                    if (row.tableCells.size < 2) continue
-                    val leftCell = row.getCell(0)
-                    val rightCell = row.getCell(1)
-                    val left = cellText(leftCell).trim()
-                    val rightRaw = cellText(rightCell)
-                    val right = rightRaw.trim()
-                    val images = cellImages(rightCell, skipped)
-                    if (left.isBlank() && right.isBlank() && images.isEmpty()) continue
-
-                    if (isQuestionRow(left, right, leftCell, rightCell, current == null)) {
-                        flush()
-                        current = RawQuestion(text = right, textImages = images.toMutableList())
-                        continue
-                    }
-
-                    val active = current
-                    if (active == null) {
-                        if (right.isNotBlank() || images.isNotEmpty()) skipped += "Строки невозможно распознать"
-                        continue
-                    }
-
-                    when {
-                        left == "*" -> active.choiceOptions += AnswerOption(right, true, images)
-                        left == "+" -> active.freeAnswers += right
-                        left == "!" -> {
-                            active.comment = right
-                            active.commentImages.clear()
-                            active.commentImages.addAll(images)
-                        }
-                        left.matches(Regex("\\d+")) -> active.orderOptions += OrderAnswer(left.toIntOrNull() ?: 0, right, images)
-                        left.isBlank() -> if (right.isNotBlank() || images.isNotEmpty()) active.choiceOptions += AnswerOption(right, false, images)
-                        else -> active.invalidReason = "Строки невозможно распознать"
-                    }
-                }
-                flush()
-            }
-        }
-        return ParseReport(questions, skipped)
-    }
-
-    private fun isQuestionRow(left: String, right: String, leftCell: XWPFTableCell, rightCell: XWPFTableCell, noActiveQuestion: Boolean): Boolean {
-        if (!left.matches(Regex("\\d+")) || right.isBlank()) return false
-        val highlighted = cellHasBold(leftCell) || cellHasBold(rightCell) || cellHasFill(leftCell) || cellHasFill(rightCell)
-        return highlighted || noActiveQuestion
-    }
-
-    private fun cellText(cell: XWPFTableCell): String {
-        return cell.paragraphs.joinToString("\n") { paragraphText(it) }
-    }
-
-    private fun paragraphText(paragraph: XWPFParagraph): String {
-        val byRuns = paragraph.runs.joinToString("") { it.text() ?: "" }
-        return byRuns.ifBlank { paragraph.text.orEmpty() }
-    }
-
-    private fun cellImages(cell: XWPFTableCell, skipped: MutableList<String>): List<EmbeddedImage> {
-        val result = mutableListOf<EmbeddedImage>()
-        for (paragraph in cell.paragraphs) {
-            for (run in paragraph.runs) {
-                val pictures = run.embeddedPictures
-                for (picture in pictures) {
-                    val data = picture.pictureData ?: continue
-                    val ext = data.suggestFileExtension().lowercase(Locale.ROOT).ifBlank { "img" }
-                    val mime = mimeForImageExtension(ext)
-                    if (mime == null) {
-                        skipped += "Некоторые изображения не удалось загрузить: неподдерживаемый формат"
-                        continue
-                    }
-                    val bytes = data.data ?: continue
-                    if (bytes.isNotEmpty()) result += EmbeddedImage(bytes, ext, mime)
-                }
-            }
-        }
-        return result
-    }
-
-    private fun cellHasBold(cell: XWPFTableCell): Boolean {
-        return cell.paragraphs.any { paragraph -> paragraph.runs.any { it.isBold } }
-    }
-
-    private fun cellHasFill(cell: XWPFTableCell): Boolean {
-        return try {
-            val fill = cell.ctTc.tcPr?.shd?.fill?.toString()?.uppercase(Locale.ROOT)
-            !fill.isNullOrBlank() && fill != "AUTO" && fill != "FFFFFF" && fill != "FFFFFF00"
-        } catch (_: Exception) {
-            false
-        }
-    }
-}
-
-data class RawQuestion(
-    val text: String,
-    val textImages: MutableList<EmbeddedImage> = mutableListOf(),
-    var comment: String = "",
-    val commentImages: MutableList<EmbeddedImage> = mutableListOf(),
-    val choiceOptions: MutableList<AnswerOption> = mutableListOf(),
-    val freeAnswers: MutableList<String> = mutableListOf(),
-    val orderOptions: MutableList<OrderAnswer> = mutableListOf(),
-    var invalidReason: String? = null
-) {
-    fun toParsedQuestion(): ValidationResult {
-        if (text.isBlank() && textImages.isEmpty()) return ValidationResult(null, "Пустой вопрос")
-        if (invalidReason != null) return ValidationResult(null, invalidReason)
-        val plus = freeAnswers.filter { it.isNotBlank() }
-        val options = choiceOptions.filter { it.text.isNotBlank() || it.images.isNotEmpty() }
-        val order = orderOptions.filter { it.order > 0 && (it.text.isNotBlank() || it.images.isNotEmpty()) }
-        if (order.isNotEmpty()) {
-            if (plus.isNotEmpty() || options.isNotEmpty()) return ValidationResult(null, "Смешанный тип вопроса")
-            if (order.size < 2) return ValidationResult(null, "Вопрос с порядком ответов содержит меньше двух вариантов")
-            if (order.map { it.order }.distinct().size != order.size) return ValidationResult(null, "Вопрос с порядком ответов содержит повторяющиеся номера")
-            val correctOrder = order.sortedBy { it.order }
-            return ValidationResult(
-                ParsedQuestion(
-                    text,
-                    comment,
-                    QuestionType.ORDER.value,
-                    correctOrder.map { it.text },
-                    correctOrder.map { it.text },
-                    textImages,
-                    correctOrder.map { it.images },
-                    commentImages,
-                    correctOrder.map { it.images }
-                ),
-                null
-            )
-        }
-        val correctChoice = options.filter { it.correct }
-        if (plus.isNotEmpty()) {
-            if (options.isNotEmpty()) return ValidationResult(null, "Смешанный тип вопроса")
-            return ValidationResult(ParsedQuestion(text, comment, QuestionType.FREE_TEXT.value, emptyList(), plus, textImages, emptyList(), commentImages, emptyList()), null)
-        }
-        if (options.size < 2) return ValidationResult(null, "Вопрос выбора с количеством вариантов меньше двух")
-        if (correctChoice.isEmpty()) return ValidationResult(null, "Вопрос без правильного ответа")
-        val type = if (correctChoice.size == 1) QuestionType.SINGLE.value else QuestionType.MULTIPLE.value
-        return ValidationResult(
-            ParsedQuestion(
-                text,
-                comment,
-                type,
-                options.map { it.text },
-                correctChoice.map { it.text },
-                textImages,
-                options.map { it.images },
-                commentImages,
-                correctChoice.map { it.images }
-            ),
-            null
-        )
-    }
-}
-
-data class EmbeddedImage(val bytes: ByteArray, val extension: String, val mime: String)
-data class ImageRef(val uri: String, val mime: String, val name: String) {
-    fun toJson(): JSONObject = JSONObject().apply {
-        put("uri", uri)
-        put("mime", mime)
-        put("name", name)
-    }
-    companion object {
-        fun fromJson(json: JSONObject): ImageRef = ImageRef(json.optString("uri", ""), json.optString("mime", ""), json.optString("name", ""))
-    }
-}
-data class AnswerOption(val text: String, val correct: Boolean, val images: List<EmbeddedImage> = emptyList())
-data class OrderAnswer(val order: Int, val text: String, val images: List<EmbeddedImage> = emptyList())
-data class ValidationResult(val question: ParsedQuestion?, val reason: String?)
-data class ParseReport(val questions: List<ParsedQuestion>, val skippedReasons: List<String>)
-data class SourceQuestions(val sourceName: String, val questions: List<ParsedQuestion>)
-
-data class ParsedQuestion(
-    val text: String,
-    val comment: String,
-    val type: String,
-    val options: List<String>,
-    val correctAnswers: List<String>,
-    val questionImages: List<EmbeddedImage> = emptyList(),
-    val optionImages: List<List<EmbeddedImage>> = emptyList(),
-    val commentImages: List<EmbeddedImage> = emptyList(),
-    val correctAnswerImages: List<List<EmbeddedImage>> = emptyList()
-) {
-    fun toAttemptQuestion(number: Int, imageSaver: (EmbeddedImage) -> ImageRef): AttemptQuestion {
-        val questionImageRefs = questionImages.map(imageSaver).toMutableList()
-        val commentImageRefs = commentImages.map(imageSaver).toMutableList()
-        val pairs = options.mapIndexed { index, option ->
-            option to optionImages.getOrElse(index) { emptyList() }.map(imageSaver).toMutableList()
-        }
-        val shuffledPairs = if (type == QuestionType.FREE_TEXT.value) emptyList() else pairs.shuffled(Random(System.nanoTime()))
-        val correctImageRefs = correctAnswerImages.map { images -> images.map(imageSaver).toMutableList() }
-        return AttemptQuestion(
-            id = UUID.randomUUID().toString(),
-            number = number,
-            text = text,
-            comment = comment,
-            type = type,
-            options = shuffledPairs.map { it.first }.toMutableList(),
-            optionImages = shuffledPairs.map { it.second }.toMutableList(),
-            correctAnswers = correctAnswers,
-            correctAnswerImages = correctImageRefs.toMutableList(),
-            questionImages = questionImageRefs,
-            commentImages = commentImageRefs,
-            selectedIndices = mutableListOf(),
-            userInput = "",
-            status = AnswerStatus.UNANSWERED.value,
-            skipped = false
-        )
-    }
-}
-
-enum class QuestionType(val value: String) { SINGLE("single"), MULTIPLE("multiple"), FREE_TEXT("free_text"), ORDER("order") }
-enum class AnswerStatus(val value: String) { UNANSWERED("unanswered"), CORRECT("correct"), INCORRECT("incorrect") }
-
-data class SourceFile(val name: String, val documentId: String) {
-    fun toJson(): JSONObject = JSONObject().apply {
-        put("name", name)
-        put("documentId", documentId)
-    }
-    companion object {
-        fun fromJson(json: JSONObject): SourceFile = SourceFile(
-            json.optString("name", ""),
-            json.optString("documentId", "")
-        )
-    }
-}
-
-data class TestTemplate(
-    var title: String,
-    val sourceFiles: MutableList<SourceFile>,
-    val questionCount: Int,
-    var strictFreeText: Boolean,
-    val attempts: MutableList<AttemptResult>,
-    var activeAttempt: AttemptState?
-) {
-    fun toJson(): JSONObject = JSONObject().apply {
-        put("schemaVersion", 3)
-        put("title", title)
-        put("sourceFiles", JSONArray().apply { sourceFiles.forEach { put(it.toJson()) } })
-        put("sourceFileName", sourceFiles.firstOrNull()?.name.orEmpty())
-        put("sourceFileId", sourceFiles.firstOrNull()?.documentId.orEmpty())
-        put("questionCount", questionCount)
-        put("strictFreeText", strictFreeText)
-        put("attempts", JSONArray().apply { attempts.forEach { put(it.toJson()) } })
-        if (activeAttempt == null) put("activeAttempt", JSONObject.NULL) else put("activeAttempt", activeAttempt!!.toJson())
-    }
-
-    companion object {
-        fun fromJson(json: JSONObject): TestTemplate {
-            val attemptsArray = json.optJSONArray("attempts") ?: JSONArray()
-            val attempts = mutableListOf<AttemptResult>()
-            for (i in 0 until attemptsArray.length()) attempts += AttemptResult.fromJson(attemptsArray.getJSONObject(i))
-            val sources = mutableListOf<SourceFile>()
-            val sourcesArray = json.optJSONArray("sourceFiles")
-            if (sourcesArray != null && sourcesArray.length() > 0) {
-                for (i in 0 until sourcesArray.length()) sources += SourceFile.fromJson(sourcesArray.getJSONObject(i))
-            } else {
-                sources += SourceFile(json.optString("sourceFileName", ""), json.optString("sourceFileId", ""))
-            }
-            val active = runCatching { json.optJSONObject("activeAttempt")?.let { AttemptState.fromJson(it) } }.getOrNull()
-            return TestTemplate(
-                title = json.optString("title", "Тест без имени"),
-                sourceFiles = sources.filter { it.name.isNotBlank() }.toMutableList(),
-                questionCount = json.optInt("questionCount", 0),
-                strictFreeText = json.optBoolean("strictFreeText", true),
-                attempts = attempts,
-                activeAttempt = active
-            )
-        }
-    }
-}
-
-data class AttemptResult(val timestampMillis: Long, val total: Int, val correct: Int, val wrong: Int, val percent: Int) {
-    fun toJson(): JSONObject = JSONObject().apply {
-        put("timestampMillis", timestampMillis)
-        put("total", total)
-        put("correct", correct)
-        put("wrong", wrong)
-        put("percent", percent)
-    }
-    companion object {
-        fun fromJson(json: JSONObject): AttemptResult = AttemptResult(
-            json.optLong("timestampMillis", 0L),
-            json.optInt("total", 0),
-            json.optInt("correct", 0),
-            json.optInt("wrong", 0),
-            json.optInt("percent", 0)
-        )
-    }
-}
-
-data class AttemptState(
-    val id: String,
-    val startedAtMillis: Long,
-    var currentIndex: Int,
-    var feedbackPending: Boolean,
-    val questions: MutableList<AttemptQuestion>
-) {
-    fun toJson(): JSONObject = JSONObject().apply {
-        put("assetSchemaVersion", 1)
-        put("id", id)
-        put("startedAtMillis", startedAtMillis)
-        put("currentIndex", currentIndex)
-        put("feedbackPending", feedbackPending)
-        put("questions", JSONArray().apply { questions.forEach { put(it.toJson()) } })
-    }
-    companion object {
-        fun fromJson(json: JSONObject): AttemptState {
-            if (json.optInt("assetSchemaVersion", 0) < 1) throw UserVisibleException("Незавершенная попытка старого формата")
-            val arr = json.optJSONArray("questions") ?: JSONArray()
-            val questions = mutableListOf<AttemptQuestion>()
-            for (i in 0 until arr.length()) questions += AttemptQuestion.fromJson(arr.getJSONObject(i))
-            if (questions.isEmpty()) throw UserVisibleException("Незавершенная попытка повреждена")
-            return AttemptState(
-                json.optString("id", UUID.randomUUID().toString()),
-                json.optLong("startedAtMillis", 0L),
-                json.optInt("currentIndex", 0).coerceIn(0, (questions.size - 1).coerceAtLeast(0)),
-                json.optBoolean("feedbackPending", false),
-                questions
-            )
-        }
-    }
-}
-
-data class AttemptQuestion(
-    val id: String,
-    val number: Int,
-    val text: String,
-    val comment: String,
-    val type: String,
-    val options: MutableList<String>,
-    val optionImages: MutableList<MutableList<ImageRef>>,
-    val correctAnswers: List<String>,
-    val correctAnswerImages: MutableList<MutableList<ImageRef>>,
-    val questionImages: MutableList<ImageRef>,
-    val commentImages: MutableList<ImageRef>,
-    val selectedIndices: MutableList<Int>,
-    var userInput: String,
-    var status: String,
-    var skipped: Boolean
-) {
-    fun toJson(): JSONObject = JSONObject().apply {
-        put("id", id)
-        put("number", number)
-        put("text", text)
-        put("comment", comment)
-        put("type", type)
-        put("options", JSONArray().apply { options.forEach { put(it) } })
-        put("optionImages", JSONArray().apply { optionImages.forEach { list -> put(JSONArray().apply { list.forEach { put(it.toJson()) } }) } })
-        put("correctAnswers", JSONArray().apply { correctAnswers.forEach { put(it) } })
-        put("correctAnswerImages", JSONArray().apply { correctAnswerImages.forEach { list -> put(JSONArray().apply { list.forEach { put(it.toJson()) } }) } })
-        put("questionImages", JSONArray().apply { questionImages.forEach { put(it.toJson()) } })
-        put("commentImages", JSONArray().apply { commentImages.forEach { put(it.toJson()) } })
-        put("selectedIndices", JSONArray().apply { selectedIndices.forEach { put(it) } })
-        put("userInput", userInput)
-        put("status", status)
-        put("skipped", skipped)
-    }
-    companion object {
-        fun fromJson(json: JSONObject): AttemptQuestion = AttemptQuestion(
-            json.optString("id", UUID.randomUUID().toString()),
-            json.optInt("number", 0),
-            json.optString("text", ""),
-            json.optString("comment", ""),
-            json.optString("type", QuestionType.SINGLE.value),
-            json.optJSONArray("options").toStringList().toMutableList(),
-            json.optJSONArray("optionImages").toNestedImageRefList().toMutableList(),
-            json.optJSONArray("correctAnswers").toStringList(),
-            json.optJSONArray("correctAnswerImages").toNestedImageRefList().toMutableList(),
-            json.optJSONArray("questionImages").toImageRefList().toMutableList(),
-            json.optJSONArray("commentImages").toImageRefList().toMutableList(),
-            json.optJSONArray("selectedIndices").toIntList().toMutableList(),
-            json.optString("userInput", ""),
-            json.optString("status", AnswerStatus.UNANSWERED.value),
-            json.optBoolean("skipped", false)
-        )
-    }
-}
-
-data class UpdateInfo(val versionName: String, val versionCode: Int, val apkUrl: String, val releaseNotes: String, val required: Boolean) {
-    companion object {
-        fun fromJson(json: JSONObject): UpdateInfo = UpdateInfo(
-            versionName = json.optString("versionName", ""),
-            versionCode = json.optInt("versionCode", 0),
-            apkUrl = json.optString("apkUrl", ""),
-            releaseNotes = json.optString("releaseNotes", ""),
-            required = json.optBoolean("required", false)
-        )
-    }
-}
-
-data class DocumentInfo(val name: String, val documentId: String, val uri: Uri, val isDirectory: Boolean)
-data class TestFile(val fileName: String, val uri: Uri, val template: TestTemplate)
-data class TestLoadResult(val tests: List<TestFile>, val warnings: List<String>)
-object SuccessOpen
-object LostFolderAccess
-class SuccessCreate(val warnings: List<String>)
-class ErrorResult(val message: String)
-class UserVisibleException(message: String) : Exception(message)
-class LostFolderAccessException : IOException("Missing file")
-
-fun JSONArray?.toStringList(): List<String> {
-    if (this == null) return emptyList()
-    val list = mutableListOf<String>()
-    for (i in 0 until length()) list += optString(i)
-    return list
-}
-fun JSONArray?.toIntList(): List<Int> {
-    if (this == null) return emptyList()
-    val list = mutableListOf<Int>()
-    for (i in 0 until length()) list += optInt(i)
-    return list
-}
-fun JSONArray?.toImageRefList(): List<ImageRef> {
-    if (this == null) return emptyList()
-    val list = mutableListOf<ImageRef>()
-    for (i in 0 until length()) {
-        val obj = optJSONObject(i) ?: continue
-        val ref = ImageRef.fromJson(obj)
-        if (ref.uri.isNotBlank()) list += ref
-    }
-    return list
-}
-fun JSONArray?.toNestedImageRefList(): List<MutableList<ImageRef>> {
-    if (this == null) return emptyList()
-    val list = mutableListOf<MutableList<ImageRef>>()
-    for (i in 0 until length()) list += optJSONArray(i).toImageRefList().toMutableList()
-    return list
-}
-fun mimeForImageExtension(ext: String): String? = when (ext.lowercase(Locale.ROOT)) {
-    "png" -> "image/png"
-    "jpg", "jpeg" -> "image/jpeg"
-    "webp" -> "image/webp"
-    "gif" -> "image/gif"
-    else -> null
-}
-
-fun Exception.safeMessage(): String = message ?: "Неизвестная ошибка"
-inline fun <T> InputStream?.useRequired(block: (InputStream) -> T): T {
-    val stream = this ?: throw LostFolderAccessException()
-    return stream.use(block)
 }
