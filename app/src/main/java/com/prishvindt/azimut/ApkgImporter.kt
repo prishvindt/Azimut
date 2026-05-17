@@ -181,37 +181,34 @@ class ApkgImporter(
                 val deckJson = JSONObject(zip.getInputStream(deckEntry).use { it.readBytes().toString(Charsets.UTF_8) })
                 if (deckJson.optString("__type__") != "Deck") throw UserVisibleException("Не удалось прочитать набор карточек.")
 
-                val deckBase = deckEntry.name.substringBeforeLast('/', "")
+                val deckBase = deckEntry.name.replace('\\', '/').substringBeforeLast('/', "")
                 val models = readZipDeckModels(deckJson)
                 val mediaEntries = readZipDeckMediaEntries(zip, deckBase)
                 val parsed = parseZipDeckCards(deckJson, models, sourceKey, progress, isCancelled)
-                val neededMedia = parsed.cards
-                    .flatMap { it.frontMediaNames + it.backMediaNames }
-                    .distinctBy { it.substringAfterLast('/').lowercase(Locale.ROOT) }
+                val neededMedia = collectNeededZipMedia(parsed.cards, mediaEntries)
                 val copiedMedia = mutableMapOf<String, CardMediaRef>()
                 var skippedMedia = 0
-                for ((index, mediaName) in neededMedia.withIndex()) {
+                for ((index, media) in neededMedia.withIndex()) {
                     checkImportCancelled(isCancelled)
                     if (shouldReportProgress(index + 1, neededMedia.size)) {
                         reportProgress(progress, "Копирование медиа: ${index + 1} из ${neededMedia.size}")
                     }
-                    val entryName = mediaEntries[mediaName]
-                        ?: mediaEntries[mediaName.substringAfterLast('/')]
-                    if (entryName == null) {
+                    val mediaEntry = media.entry
+                    if (mediaEntry == null) {
                         skippedMedia += 1
                         continue
                     }
-                    val entry = zip.getEntry(entryName)
+                    val entry = zip.getEntry(mediaEntry.entryName)
                     if (entry == null) {
                         skippedMedia += 1
                         continue
                     }
-                    val type = CardMediaType.fromFileName(mediaName.substringAfterLast('/'))
+                    val type = CardMediaType.fromFileName(mediaEntry.mediaPath.substringAfterLast('/'))
                     if (type == null) {
                         skippedMedia += 1
                         continue
                     }
-                    val storedName = storedMediaFileName(sourceKey, mediaName)
+                    val storedName = storedZipMediaFileName(sourceKey, mediaEntry.mediaPath)
                     val copied = runCatching {
                         zip.getInputStream(entry).use { input ->
                             cardStore.saveMedia(mediaSession, storedName, type, input)
@@ -220,14 +217,13 @@ class ApkgImporter(
                     if (copied == null) {
                         skippedMedia += 1
                     } else {
-                        copiedMedia[mediaName] = copied
-                        copiedMedia.putIfAbsent(mediaName.substringAfterLast('/'), copied)
+                        copiedMedia[mediaEntry.mediaPath] = copied
                     }
                 }
 
                 val importedCards = parsed.cards.map { pending ->
-                    val frontMedia = pending.frontMediaNames.mapNotNull { copiedMedia[it] ?: copiedMedia[it.substringAfterLast('/')] }
-                    val backMedia = pending.backMediaNames.mapNotNull { copiedMedia[it] ?: copiedMedia[it.substringAfterLast('/')] }
+                    val frontMedia = pending.frontMediaNames.mapNotNull { copiedZipMediaRef(mediaEntries, copiedMedia, it) }
+                    val backMedia = pending.backMediaNames.mapNotNull { copiedZipMediaRef(mediaEntries, copiedMedia, it) }
                     ImportedCard(
                         id = pending.id,
                         frontHtml = pending.frontHtml,
@@ -243,6 +239,40 @@ class ApkgImporter(
         } finally {
             tempZip.delete()
         }
+    }
+
+    private fun collectNeededZipMedia(
+        cards: List<PendingImportedCard>,
+        mediaEntries: ZipDeckMediaEntries
+    ): List<NeededZipMedia> {
+        val result = linkedMapOf<String, NeededZipMedia>()
+        for (mediaName in cards.flatMap { it.frontMediaNames + it.backMediaNames }) {
+            val normalized = normalizeZipMediaPath(mediaName) ?: continue
+            val entry = resolveZipMediaEntry(mediaEntries, normalized)
+            val key = entry?.mediaPath ?: normalized
+            result.putIfAbsent(key, NeededZipMedia(entry))
+        }
+        return result.values.toList()
+    }
+
+    private fun copiedZipMediaRef(
+        mediaEntries: ZipDeckMediaEntries,
+        copiedMedia: Map<String, CardMediaRef>,
+        mediaName: String
+    ): CardMediaRef? {
+        val entry = resolveZipMediaEntry(mediaEntries, mediaName) ?: return null
+        return copiedMedia[entry.mediaPath]
+    }
+
+    private fun resolveZipMediaEntry(
+        mediaEntries: ZipDeckMediaEntries,
+        reference: String
+    ): ZipDeckMediaEntry? {
+        val normalized = normalizeZipMediaPath(reference) ?: return null
+        mediaEntries.entriesByPath[normalized]?.let { return it }
+        mediaEntries.aliasesByPath[normalized]?.let { return it }
+        if ('/' in normalized) return null
+        return mediaEntries.entriesByBasename[normalized.lowercase(Locale.ROOT)]
     }
 
     private fun parseCardsFromDatabase(dbFile: File, sourceKey: String): PendingPackageResult {
@@ -959,28 +989,92 @@ class ApkgImporter(
         return mapping
     }
 
-    private fun readZipDeckMediaEntries(zip: ZipFile, deckBase: String): Map<String, String> {
-        val mapping = mutableMapOf<String, String>()
+    private fun readZipDeckMediaEntries(zip: ZipFile, deckBase: String): ZipDeckMediaEntries {
+        val entriesByPath = linkedMapOf<String, ZipDeckMediaEntry>()
+        val aliasesByPath = linkedMapOf<String, ZipDeckMediaEntry>()
+        val entriesByBasename = mutableMapOf<String, ZipDeckMediaEntry?>()
         val entries = zip.entries()
         while (entries.hasMoreElements()) {
             val entry = entries.nextElement()
             if (entry.isDirectory) continue
-            val name = entry.name.replace('\\', '/')
+            val name = normalizeZipMediaPath(entry.name) ?: continue
             if (!isZipDeckMediaEntry(name, deckBase)) continue
-            if (CardMediaType.fromFileName(name.substringAfterLast('/')) == null) continue
-            val afterMedia = name.substringAfter("/media/", name.substringAfter("media/", name))
-            mapping.putIfAbsent(afterMedia, entry.name)
-            mapping.putIfAbsent(afterMedia.substringAfterLast('/'), entry.name)
-            mapping.putIfAbsent(name, entry.name)
+            val mediaPath = zipDeckMediaPath(name, deckBase) ?: continue
+            if (CardMediaType.fromFileName(mediaPath.substringAfterLast('/')) == null) continue
+            val mediaEntry = entriesByPath[mediaPath] ?: ZipDeckMediaEntry(mediaPath, entry.name)
+            if (mediaPath !in entriesByPath) {
+                entriesByPath[mediaPath] = mediaEntry
+                addZipDeckBasenameEntry(entriesByBasename, mediaEntry)
+            }
+            addZipDeckMediaAlias(aliasesByPath, name, mediaEntry)
+            addZipDeckMediaAlias(aliasesByPath, "media/$mediaPath", mediaEntry)
         }
-        return mapping
+        return ZipDeckMediaEntries(entriesByPath, aliasesByPath, entriesByBasename)
     }
 
     private fun isZipDeckMediaEntry(entryName: String, deckBase: String): Boolean {
-        val basePrefix = deckBase.trim('/').let { if (it.isBlank()) "" else "$it/" }
+        val basePrefix = normalizeZipDirectoryPath(deckBase).let { if (it.isBlank()) "" else "$it/" }
         return entryName.startsWith("${basePrefix}media/", ignoreCase = true) ||
             entryName.startsWith("media/", ignoreCase = true) ||
             entryName.contains("/media/", ignoreCase = true)
+    }
+
+    private fun zipDeckMediaPath(entryName: String, deckBase: String): String? {
+        val basePrefix = normalizeZipDirectoryPath(deckBase).let { if (it.isBlank()) "" else "$it/" }
+        val rawPath = when {
+            entryName.startsWith("${basePrefix}media/", ignoreCase = true) ->
+                entryName.substring("${basePrefix}media/".length)
+            entryName.startsWith("media/", ignoreCase = true) ->
+                entryName.substring("media/".length)
+            else -> {
+                val mediaIndex = entryName.indexOf("/media/", ignoreCase = true)
+                if (mediaIndex < 0) return null
+                entryName.substring(mediaIndex + "/media/".length)
+            }
+        }
+        return normalizeZipMediaPath(rawPath)
+    }
+
+    private fun addZipDeckMediaAlias(
+        aliasesByPath: MutableMap<String, ZipDeckMediaEntry>,
+        alias: String,
+        entry: ZipDeckMediaEntry
+    ) {
+        val normalized = normalizeZipMediaPath(alias) ?: return
+        if (normalized == entry.mediaPath) return
+        aliasesByPath.putIfAbsent(normalized, entry)
+    }
+
+    private fun addZipDeckBasenameEntry(
+        entriesByBasename: MutableMap<String, ZipDeckMediaEntry?>,
+        entry: ZipDeckMediaEntry
+    ) {
+        val basenameKey = entry.mediaPath.substringAfterLast('/').lowercase(Locale.ROOT)
+        val existing = entriesByBasename[basenameKey]
+        if (!entriesByBasename.containsKey(basenameKey)) {
+            entriesByBasename[basenameKey] = entry
+        } else if (existing?.mediaPath != entry.mediaPath) {
+            entriesByBasename[basenameKey] = null
+        }
+    }
+
+    private fun normalizeZipMediaPath(value: String): String? {
+        var path = value.replace('\\', '/').trim()
+        path = path.replace(Regex("/+"), "/")
+        while (path.startsWith("/")) path = path.removePrefix("/")
+        while (path.startsWith("./")) path = path.removePrefix("./")
+        path = path.replace(Regex("/+"), "/")
+        if (path.isBlank()) return null
+        val segments = path.split('/')
+        if (segments.any { it == ".." }) return null
+        return path
+    }
+
+    private fun normalizeZipDirectoryPath(value: String): String {
+        var path = value.replace('\\', '/').trim()
+        path = path.replace(Regex("/+"), "/").trim('/')
+        while (path.startsWith("./")) path = path.removePrefix("./")
+        return if (path.split('/').any { it == ".." }) "" else path
     }
 
     private fun findDatabaseEntry(zip: ZipFile) = zip.getEntry("collection.anki21")
@@ -1021,6 +1115,12 @@ class ApkgImporter(
         val fileName = originalName.substringAfterLast('/').substringAfterLast('\\').ifBlank { UUID.randomUUID().toString() }
         val cleaned = sanitizeMediaFileName(fileName)
         return "${sourceKey}_$cleaned"
+    }
+
+    private fun storedZipMediaFileName(sourceKey: String, normalizedMediaPath: String): String {
+        val pathName = normalizedMediaPath.replace('/', '_').ifBlank { UUID.randomUUID().toString() }
+        val cleaned = sanitizeMediaFileName(pathName)
+        return "${sourceKey}_${stableSourceKey(normalizedMediaPath)}_$cleaned"
     }
 
     private fun sanitizeMediaFileName(value: String): String {
@@ -1111,6 +1211,21 @@ class ApkgImporter(
     private fun checkImportCancelled(isCancelled: () -> Boolean) {
         if (isCancelled()) throw CardImportCancelledException()
     }
+
+    private data class NeededZipMedia(
+        val entry: ZipDeckMediaEntry?
+    )
+
+    private data class ZipDeckMediaEntries(
+        val entriesByPath: Map<String, ZipDeckMediaEntry>,
+        val aliasesByPath: Map<String, ZipDeckMediaEntry>,
+        val entriesByBasename: Map<String, ZipDeckMediaEntry?>
+    )
+
+    private data class ZipDeckMediaEntry(
+        val mediaPath: String,
+        val entryName: String
+    )
 
     private data class SinglePackageResult(
         val cards: List<ImportedCard>,
