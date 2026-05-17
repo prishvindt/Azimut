@@ -24,6 +24,7 @@ import android.provider.DocumentsContract
 import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
+import android.text.TextUtils
 import android.text.TextWatcher
 import android.view.DragEvent
 import android.view.MotionEvent
@@ -74,11 +75,14 @@ class MainActivity : Activity() {
     private lateinit var contentFrame: FrameLayout
     private lateinit var updateArea: LinearLayout
     private lateinit var tabRow: LinearLayout
+    private lateinit var bottomActionRow: LinearLayout
     private lateinit var cardsTab: TextView
     private lateinit var testsTab: TextView
-    private lateinit var settingsButton: ImageButton
+    private lateinit var menuButton: LinearLayout
+    private lateinit var bottomSettingsButton: LinearLayout
 
-    private var activeScreen = Screen.TESTS
+    private var activeScreen = Screen.CARDS
+    private var lastTabScreen = Screen.CARDS
     private var runningTestFile: TestFile? = null
     private var availableUpdate: UpdateInfo? = null
     private var updateDismissedThisRun = false
@@ -134,16 +138,21 @@ class MainActivity : Activity() {
         contentFrame = findViewById(R.id.contentFrame)
         updateArea = findViewById(R.id.updateArea)
         tabRow = findViewById(R.id.tabRow)
+        bottomActionRow = findViewById(R.id.bottomActionRow)
         cardsTab = findViewById(R.id.cardsTab)
         testsTab = findViewById(R.id.testsTab)
-        settingsButton = findViewById(R.id.settingsButton)
+        menuButton = findViewById(R.id.menuButton)
+        bottomSettingsButton = findViewById(R.id.bottomSettingsButton)
 
+        configureBottomActionButton(menuButton, R.drawable.ic_menu_24, "Меню")
+        configureBottomActionButton(bottomSettingsButton, R.drawable.ic_settings_24, "Настройки")
         cardsTab.setOnClickListener { showCardsTab() }
         testsTab.setOnClickListener { showTestsTab() }
-        settingsButton.setOnClickListener { showSettingsTab() }
+        menuButton.setOnClickListener { showTabMenu() }
+        bottomSettingsButton.setOnClickListener { showSettingsScreen() }
         registerUpdateDownloadReceiver()
         validateSavedFolderAccess()
-        showTestsTab()
+        showCardsTab()
         contentFrame.post {
             showUpdatesDialogIfNeeded()
             checkForUpdates(force = false)
@@ -174,8 +183,10 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         if (runningTestFile != null) {
             runningTestFile = null
-            tabRow.visibility = View.VISIBLE
+            showTabChrome()
             showTestsTab()
+        } else if (activeScreen == Screen.SETTINGS || activeScreen == Screen.STATISTICS) {
+            showLastTabScreen()
         } else {
             super.onBackPressed()
         }
@@ -200,7 +211,7 @@ class MainActivity : Activity() {
             prefs.edit().putString(PREF_FOLDER_URI, uri.toString()).apply()
             if (!hasPersistedFolderPermission(uri)) {
                 handleLostFolderAccess()
-                showSettingsTab()
+                showSettingsScreen()
                 return
             }
             showTestsTab()
@@ -210,21 +221,28 @@ class MainActivity : Activity() {
     private fun showCardsTab() {
         runningTestFile = null
         activeScreen = Screen.CARDS
-        tabRow.visibility = View.VISIBLE
+        lastTabScreen = Screen.CARDS
+        showTabChrome()
         renderUpdateArea()
         setNavigationSelection(Screen.CARDS)
         contentFrame.removeAllViews()
 
-        val empty = verticalContainer()
-        empty.gravity = Gravity.CENTER
-        empty.addView(text("Будет позже", 18, true))
+        val empty = verticalContainer().apply {
+            gravity = Gravity.CENTER
+        }
+        empty.addView(centeredText("Колоды карточек", 20, true))
+        empty.addView(spacer(8))
+        empty.addView(centeredText("Колоды пока не созданы.", 16, false))
+        empty.addView(spacer(8))
+        empty.addView(centeredText("Нажмите «Меню» → «Создать колоду».", 16, false))
         contentFrame.addView(empty)
     }
 
     private fun showTestsTab() {
         runningTestFile = null
         activeScreen = Screen.TESTS
-        tabRow.visibility = View.VISIBLE
+        lastTabScreen = Screen.TESTS
+        showTabChrome()
         renderUpdateArea()
         setNavigationSelection(Screen.TESTS)
         contentFrame.removeAllViews()
@@ -276,20 +294,18 @@ class MainActivity : Activity() {
         empty.gravity = Gravity.CENTER
         empty.addView(text("Папка с вопросами не выбрана", 18, true))
         empty.addView(spacer(12))
-        empty.addView(button("Открыть настройки") { showSettingsTab() })
+        empty.addView(button("Открыть настройки") { showSettingsScreen() })
         contentFrame.addView(empty)
     }
 
-    private fun showSettingsTab() {
+    private fun showSettingsScreen() {
         runningTestFile = null
         activeScreen = Screen.SETTINGS
-        tabRow.visibility = View.VISIBLE
-        renderUpdateArea()
-        setNavigationSelection(Screen.SETTINGS)
+        showStandaloneChrome()
         contentFrame.removeAllViews()
 
-        val scroll = ScrollView(this)
-        scroll.isFillViewport = true
+        val root = standaloneRoot("Настройки")
+        val scroll = ScrollView(this).apply { isFillViewport = true }
         val box = verticalContainer()
         scroll.addView(box)
 
@@ -299,30 +315,28 @@ class MainActivity : Activity() {
         }
         val folderButtonText = if (folderName != null) "Папка: $folderName" else "Выбрать папку с вопросами"
 
-        box.addView(sectionTitle("Папка с вопросами"))
         val folderRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val folderButton = button(folderButtonText) { openFolderPicker() }
-        val refreshButton = iconButton(R.drawable.ic_refresh_24, "Обновить список файлов") { refreshDocxListMessage() }
+        val folderButton = rowButton(folderButtonText) { openFolderPicker() }
+        val refreshButton = squareIconButton(R.drawable.ic_refresh_24, "Обновить список файлов") { refreshDocxListMessage() }
         folderRow.addView(folderButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(0, 0, dp(8), 0) })
         folderRow.addView(refreshButton, LinearLayout.LayoutParams(dp(48), dp(48)))
         box.addView(folderRow)
         box.addView(spacer(16))
 
-        box.addView(button("Создать тест") { chooseDocxForNewTest() })
+        box.addView(rowButton("Проверить обновления") { checkForUpdates(force = true) })
         box.addView(spacer(8))
-        box.addView(button("Проверить обновления") { checkForUpdates(force = true) })
+        box.addView(text("Текущая версия: ${BuildConfig.VERSION_NAME}", 15, false).apply { setPadding(0, dp(4), 0, dp(4)) })
         box.addView(spacer(8))
-        box.addView(text("Текущая версия: ${BuildConfig.VERSION_NAME}", 15, false))
-        box.addView(spacer(8))
-        box.addView(button("О приложении") { showAboutDialog() })
+        box.addView(rowButton("О приложении") { showAboutDialog() })
         box.addView(spacer(24))
 
         // Настройка темы скрыта. Логика оставлена в коде, приложение использует системную тему.
 
-        contentFrame.addView(scroll)
+        root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        contentFrame.addView(root)
     }
 
     private fun openFolderPicker() {
@@ -343,14 +357,14 @@ class MainActivity : Activity() {
         }
         try {
             val files = withFolderAccess(uri) { saf.listDocxFiles(uri) } ?: run {
-                showSettingsTab()
+                showSettingsScreen()
                 return
             }
             val message = if (files.isEmpty()) "Новых файлов нет" else "Файлов найдено: ${files.size}"
             Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             if (handleLostFolderError(e)) {
-                showSettingsTab()
+                showSettingsScreen()
                 return
             }
             showMessage("Ошибка", "Не удалось обновить список файлов: ${e.safeMessage()}")
@@ -367,7 +381,7 @@ class MainActivity : Activity() {
             )
             .setNegativeButton("ОК", null)
             .setPositiveButton("Открыть GitHub") { _, _ -> openGitHubPage() }
-            .show()
+            .showRounded()
     }
 
     private fun openGitHubPage() {
@@ -375,6 +389,108 @@ class MainActivity : Activity() {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/prishvindt/Azimut")))
         } catch (_: Exception) {
             Toast.makeText(this, "Не удалось открыть ссылку.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showTabMenu() {
+        when (activeScreen) {
+            Screen.CARDS -> showCardsMenu()
+            Screen.TESTS -> showTestsMenu()
+            else -> Unit
+        }
+    }
+
+    private fun showTestsMenu() {
+        val layout = menuDialogLayout()
+        var dialog: AlertDialog? = null
+        layout.addView(menuDialogRow("Создать тест") {
+            dialog?.dismiss()
+            chooseDocxForNewTest()
+        })
+        layout.addView(spacer(8))
+        layout.addView(menuDialogRow("Статистика") {
+            dialog?.dismiss()
+            showStatisticsScreen()
+        })
+        dialog = AlertDialog.Builder(this)
+            .setView(layout)
+            .create()
+        dialog.showRounded()
+    }
+
+    private fun showCardsMenu() {
+        val layout = menuDialogLayout()
+        var dialog: AlertDialog? = null
+        layout.addView(menuDialogRow("Создать колоду") {
+            dialog?.dismiss()
+            showDecksStubDialog()
+        })
+        dialog = AlertDialog.Builder(this)
+            .setView(layout)
+            .create()
+        dialog.showRounded()
+    }
+
+    private fun showDecksStubDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Колоды карточек")
+            .setMessage("Колоды пока не созданы.")
+            .setPositiveButton("ОК", null)
+            .showRounded()
+    }
+
+    private fun showStatisticsScreen() {
+        runningTestFile = null
+        activeScreen = Screen.STATISTICS
+        showStandaloneChrome()
+        contentFrame.removeAllViews()
+
+        val root = standaloneRoot("Статистика")
+        val scroll = ScrollView(this).apply { isFillViewport = true }
+        val box = verticalContainer()
+        scroll.addView(box)
+
+        val tests = loadTestsForStatistics().tests
+        val completedAttempts = tests.flatMap { it.template.attempts }
+        val activeAttemptCount = tests.count { it.template.activeAttempt != null }
+        val totalAttempts = completedAttempts.size + activeAttemptCount
+        val completedCount = completedAttempts.size
+        val average = averagePercent(completedAttempts)
+        val best = completedAttempts.maxOfOrNull { it.percent } ?: 0
+
+        box.addView(statLine("Всего тестов", tests.size.toString()))
+        box.addView(statLine("Всего попыток", totalAttempts.toString()))
+        box.addView(statLine("Завершённых попыток", completedCount.toString()))
+        box.addView(statLine("Средний результат", "$average%"))
+        box.addView(statLine("Лучший результат", "$best%"))
+
+        if (completedAttempts.isEmpty()) {
+            box.addView(spacer(8))
+            box.addView(text("Попыток пока нет.", 15, false))
+        }
+
+        box.addView(spacer(16))
+        if (tests.isEmpty()) {
+            box.addView(centeredText("Тесты пока не созданы.", 16, false))
+        } else {
+            tests.forEach { file -> box.addView(testStatsCard(file.template)) }
+        }
+
+        root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        contentFrame.addView(root)
+    }
+
+    private fun loadTestsForStatistics(): TestLoadResult {
+        val rootUri = savedFolderUri() ?: return TestLoadResult(emptyList(), emptyList())
+        return try {
+            withFolderAccess(rootUri) { saf.loadExistingTests(rootUri) } ?: TestLoadResult(emptyList(), emptyList())
+        } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                TestLoadResult(emptyList(), emptyList())
+            } else {
+                showMessage("Ошибка", "Не удалось загрузить статистику: ${e.safeMessage()}")
+                TestLoadResult(emptyList(), emptyList())
+            }
         }
     }
 
@@ -386,12 +502,12 @@ class MainActivity : Activity() {
         }
         val files = try {
             withFolderAccess(uri) { saf.listDocxFiles(uri) } ?: run {
-                showSettingsTab()
+                showSettingsScreen()
                 return
             }
         } catch (e: Exception) {
             if (handleLostFolderError(e)) {
-                showSettingsTab()
+                showSettingsScreen()
                 return
             }
             showMessage("Ошибка", "Не удалось прочитать папку: ${e.safeMessage()}")
@@ -435,7 +551,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        dialog.show()
+        dialog.showRounded()
     }
 
     private fun showCreateTestDialog(rootUri: Uri, sources: List<DocumentInfo>) {
@@ -493,7 +609,7 @@ class MainActivity : Activity() {
                 createTestFromDocx(rootUri, sources, title, requested, strictSwitch.isChecked)
             }
         }
-        dialog.show()
+        dialog.showRounded()
     }
 
     private fun createTestFromDocx(rootUri: Uri, sources: List<DocumentInfo>, title: String, requestedCount: Int, strictFreeText: Boolean) {
@@ -531,7 +647,7 @@ class MainActivity : Activity() {
                 when (result) {
                     LostFolderAccess -> {
                         handleLostFolderAccess()
-                        showSettingsTab()
+                        showSettingsScreen()
                     }
                     is SuccessCreate -> {
                         if (result.warnings.isNotEmpty()) {
@@ -539,7 +655,7 @@ class MainActivity : Activity() {
                                 .setTitle("Тест создан")
                                 .setMessage(result.warnings.joinToString("\n\n"))
                                 .setPositiveButton("ОК") { _, _ -> showTestsTab() }
-                                .show()
+                                .showRounded()
                         } else {
                             Toast.makeText(this, "Тест создан", Toast.LENGTH_SHORT).show()
                             showTestsTab()
@@ -593,7 +709,7 @@ class MainActivity : Activity() {
                     2 -> showStatsDialog(file.template)
                 }
             }
-            .show()
+            .showRounded()
     }
 
     private fun showEditTestDialog(file: TestFile) {
@@ -644,7 +760,7 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            .show()
+            .showRounded()
     }
 
     private fun confirmDeleteTest(file: TestFile) {
@@ -665,13 +781,12 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            .show()
+            .showRounded()
     }
 
     private fun showStatsDialog(test: TestTemplate) {
-        val filesBlock = "Исходные файлы:\n" + test.sourceFiles.mapIndexed { idx, src -> "${idx + 1}. ${src.name}" }.joinToString("\n")
-        val attemptsBlock = if (test.attempts.isEmpty()) {
-            "Попыток: 0"
+        val message = if (test.attempts.isEmpty()) {
+            "Попыток пока нет."
         } else {
             test.attempts.mapIndexed { idx, attempt ->
                 "Попытка ${idx + 1}\n" +
@@ -682,8 +797,6 @@ class MainActivity : Activity() {
                     "Результат: ${attempt.percent}%"
             }.joinToString("\n\n")
         }
-        val modeBlock = if (test.strictFreeText) "Строгий режим" else "Свободный режим"
-        val message = "$filesBlock\n\n$modeBlock\n\n$attemptsBlock"
         val scroll = ScrollView(this)
         val txt = text(message, 15, false)
         txt.setPadding(dp(8), dp(8), dp(8), dp(8))
@@ -692,7 +805,7 @@ class MainActivity : Activity() {
             .setTitle("Статистика")
             .setView(scroll)
             .setPositiveButton("Закрыть", null)
-            .show()
+            .showRounded()
     }
 
     private fun openTest(file: TestFile) {
@@ -765,6 +878,7 @@ class MainActivity : Activity() {
         val attempt = file.template.activeAttempt ?: return
         runningTestFile = file
         tabRow.visibility = View.GONE
+        bottomActionRow.visibility = View.GONE
         updateArea.visibility = View.GONE
         contentFrame.removeAllViews()
 
@@ -1111,15 +1225,15 @@ class MainActivity : Activity() {
             .setMessage("Всего вопросов: $total\nПравильно: $correct\nНеправильно: $wrong\nРезультат: $percent%")
             .setPositiveButton("Закрыть") { _, _ ->
                 runningTestFile = null
-                tabRow.visibility = View.VISIBLE
+                showTabChrome()
                 showTestsTab()
             }
             .setOnCancelListener {
                 runningTestFile = null
-                tabRow.visibility = View.VISIBLE
+                showTabChrome()
                 showTestsTab()
             }
-            .show()
+            .showRounded()
     }
 
     private fun persistRunning(file: TestFile): Boolean {
@@ -1139,21 +1253,18 @@ class MainActivity : Activity() {
     private fun setNavigationSelection(screen: Screen) {
         val cardsSelected = screen == Screen.CARDS
         val testsSelected = screen == Screen.TESTS
-        val settingsSelected = screen == Screen.SETTINGS
 
         cardsTab.background = tabBackground(cardsSelected)
         testsTab.background = tabBackground(testsSelected)
-        settingsButton.background = tabBackground(settingsSelected)
 
-        cardsTab.setTextColor(if (cardsSelected) Color.WHITE else textColor())
-        testsTab.setTextColor(if (testsSelected) Color.WHITE else textColor())
-        settingsButton.setColorFilter(if (settingsSelected) Color.WHITE else textColor())
+        cardsTab.setTextColor(if (cardsSelected) activeTabTextColor() else quietControlTextColor())
+        testsTab.setTextColor(if (testsSelected) activeTabTextColor() else quietControlTextColor())
     }
 
     private fun tabBackground(selected: Boolean): GradientDrawable = if (selected) {
-        rounded(purple(), 0, Color.TRANSPARENT, dp(12))
+        rounded(activeTabFillColor(), dp(1), outlineColor(), dp(12))
     } else {
-        rounded(Color.TRANSPARENT, dp(1), borderColor(), dp(12))
+        outlineBackground(dp(12))
     }
 
     private fun openBusyDialog(message: String): AlertDialog = AlertDialog.Builder(this)
@@ -1165,7 +1276,7 @@ class MainActivity : Activity() {
     private var busyDialog: AlertDialog? = null
     private fun showBusy(message: String) {
         busyDialog?.dismiss()
-        busyDialog = openBusyDialog(message).also { it.show() }
+        busyDialog = openBusyDialog(message).showRounded()
     }
     private fun hideBusy() {
         busyDialog?.dismiss()
@@ -1187,7 +1298,10 @@ class MainActivity : Activity() {
 
     private fun validateSavedFolderAccess(): Boolean {
         val uri = rawSavedFolderUri() ?: return true
-        if (hasPersistedFolderPermission(uri)) return true
+        if (hasPersistedFolderPermission(uri)) {
+            runCatching { saf.ensureNoMediaInServiceMipmapDirs(uri) }
+            return true
+        }
         handleLostFolderAccess()
         return false
     }
@@ -1220,7 +1334,7 @@ class MainActivity : Activity() {
         prefs.edit().remove(PREF_FOLDER_URI).apply()
         runOnUiThread {
             runningTestFile = null
-            tabRow.visibility = View.VISIBLE
+            applyChromeForCurrentScreen()
             if (lostFolderAccessDialogVisible) return@runOnUiThread
             lostFolderAccessDialogVisible = true
             AlertDialog.Builder(this)
@@ -1231,7 +1345,7 @@ class MainActivity : Activity() {
                 .create()
                 .apply {
                     setOnDismissListener { lostFolderAccessDialogVisible = false }
-                    show()
+                    showRounded()
                 }
         }
     }
@@ -1301,7 +1415,7 @@ class MainActivity : Activity() {
             .setTitle("Изображение")
             .setView(scroll)
             .setPositiveButton("ОК", null)
-            .show()
+            .showRounded()
     }
 
     private fun addCorrectAnswersViews(parent: LinearLayout, question: AttemptQuestion) {
@@ -1340,7 +1454,7 @@ class MainActivity : Activity() {
                 """.trimIndent()
             )
             .setPositiveButton("ОК", null)
-            .show()
+            .showRounded()
     }
 
     private fun showUpdatesDialogIfNeeded() {
@@ -1352,11 +1466,11 @@ class MainActivity : Activity() {
                 """
                 Добавлено:
                 - Вкладка «Карточки» с временной заглушкой.
-                - Настройки перенесены в отдельный экран под кнопкой с шестеренкой.
+                - Меню и настройки перенесены в нижнюю панель.
                 """.trimIndent()
             )
             .setPositiveButton("ОК", null)
-            .show()
+            .showRounded()
     }
 
     private fun registerUpdateDownloadReceiver() {
@@ -1426,6 +1540,10 @@ class MainActivity : Activity() {
 
     private fun renderUpdateArea() {
         updateArea.removeAllViews()
+        if (runningTestFile != null || (activeScreen != Screen.CARDS && activeScreen != Screen.TESTS)) {
+            updateArea.visibility = View.GONE
+            return
+        }
         val info = availableUpdate
         if (info == null || updateDismissedThisRun) {
             updateArea.visibility = View.GONE
@@ -1673,8 +1791,49 @@ class MainActivity : Activity() {
         return "Попыток: ${test.attempts.size}, лучший: $best%, последний: $last%"
     }
 
+    private fun averagePercent(attempts: List<AttemptResult>): Int {
+        return if (attempts.isEmpty()) 0 else attempts.map { it.percent }.average().roundToInt()
+    }
+
+    private fun statLine(label: String, value: String): TextView {
+        return text("$label: $value", 16, false).apply { setPadding(0, dp(3), 0, dp(3)) }
+    }
+
+    private fun testStatsCard(test: TestTemplate): View {
+        val card = verticalContainer().apply {
+            background = rounded(cardColor(), dp(1), borderColor(), dp(8))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(0, 0, 0, dp(10)) }
+        }
+        val attempts = test.attempts
+        card.addView(text(test.title, 17, true))
+        card.addView(spacer(6))
+        if (attempts.isEmpty()) {
+            card.addView(text("Попыток пока нет.", 14, false))
+        } else {
+            card.addView(text("Попыток: ${attempts.size}", 14, false))
+            card.addView(text("Лучший результат: ${attempts.maxOf { it.percent }}%", 14, false))
+            card.addView(text("Средний результат: ${averagePercent(attempts)}%", 14, false))
+            card.addView(text("Последний результат: ${attempts.last().percent}%", 14, false))
+        }
+        if (test.activeAttempt != null) {
+            card.addView(spacer(4))
+            card.addView(text("Есть незавершённая попытка", 14, true))
+        }
+        return card
+    }
+
     private fun showMessage(title: String, message: String) {
-        AlertDialog.Builder(this).setTitle(title).setMessage(message).setPositiveButton("ОК", null).show()
+        AlertDialog.Builder(this).setTitle(title).setMessage(message).setPositiveButton("ОК", null).showRounded()
+    }
+
+    private fun AlertDialog.Builder.showRounded(): AlertDialog = create().showRounded()
+
+    private fun AlertDialog.showRounded(): AlertDialog {
+        show()
+        window?.setBackgroundDrawable(rounded(dialogBackgroundColor(), 0, Color.TRANSPARENT, dp(16)))
+        return this
     }
 
     private fun verticalContainer(): LinearLayout = LinearLayout(this).apply {
@@ -1697,6 +1856,124 @@ class MainActivity : Activity() {
         if (bold) typeface = Typeface.DEFAULT_BOLD
         includeFontPadding = true
     }
+    private fun centeredText(value: String, sp: Int, bold: Boolean): TextView = text(value, sp, bold).apply {
+        gravity = Gravity.CENTER
+        textAlignment = View.TEXT_ALIGNMENT_CENTER
+    }
+    private fun configureBottomActionButton(button: LinearLayout, drawableRes: Int, label: String) {
+        button.apply {
+            removeAllViews()
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = outlineBackground(dp(12))
+            isClickable = true
+            isFocusable = true
+            setPadding(dp(12), 0, dp(12), 0)
+
+            val icon = ImageView(this@MainActivity).apply {
+                setImageResource(drawableRes)
+                setColorFilter(quietControlTextColor())
+            }
+            val text = text(label, 16, true).apply {
+                setTextColor(quietControlTextColor())
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            addView(icon, LinearLayout.LayoutParams(dp(24), dp(24)))
+            addView(text, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(8), 0, 0, 0)
+            })
+        }
+    }
+    private fun showTabChrome() {
+        tabRow.visibility = View.VISIBLE
+        bottomActionRow.visibility = View.VISIBLE
+    }
+    private fun showStandaloneChrome() {
+        tabRow.visibility = View.GONE
+        bottomActionRow.visibility = View.GONE
+        updateArea.visibility = View.GONE
+    }
+    private fun applyChromeForCurrentScreen() {
+        if (activeScreen == Screen.CARDS || activeScreen == Screen.TESTS) {
+            showTabChrome()
+            renderUpdateArea()
+        } else {
+            showStandaloneChrome()
+        }
+    }
+    private fun showLastTabScreen() {
+        when (lastTabScreen) {
+            Screen.TESTS -> showTestsTab()
+            else -> showCardsTab()
+        }
+    }
+    private fun standaloneRoot(title: String): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setBackgroundColor(backgroundColor())
+        addView(screenHeader(title), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(56)))
+    }
+    private fun screenHeader(title: String): TextView = TextView(this).apply {
+        text = "← $title"
+        textSize = 20f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER_VERTICAL
+        setTextColor(textColor())
+        setPadding(dp(16), 0, dp(16), 0)
+        setBackgroundColor(backgroundColor())
+        isClickable = true
+        isFocusable = true
+        setOnClickListener { showLastTabScreen() }
+    }
+    private fun menuDialogLayout(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(8), dp(12), dp(8), dp(12))
+    }
+    private fun menuDialogRow(value: String, click: () -> Unit): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        background = outlineBackground(dp(12))
+        minimumHeight = dp(52)
+        setPadding(dp(14), 0, dp(10), 0)
+        isClickable = true
+        isFocusable = true
+        setOnClickListener { click() }
+
+        val label = text(value, 16, false).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setTextColor(quietControlTextColor())
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val arrow = ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_chevron_right_24)
+            setColorFilter(quietControlTextColor())
+        }
+        addView(label, LinearLayout.LayoutParams(0, dp(52), 1f))
+        addView(arrow, LinearLayout.LayoutParams(dp(24), dp(24)))
+    }
+    private fun rowButton(value: String, click: () -> Unit): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        background = outlineBackground(dp(12))
+        minimumHeight = dp(48)
+        setPadding(dp(14), 0, dp(10), 0)
+        isClickable = true
+        isFocusable = true
+        setOnClickListener { click() }
+
+        val label = text(value, 15, false).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setTextColor(quietControlTextColor())
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val arrow = ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_chevron_right_24)
+            setColorFilter(quietControlTextColor())
+        }
+        addView(label, LinearLayout.LayoutParams(0, dp(48), 1f))
+        addView(arrow, LinearLayout.LayoutParams(dp(24), dp(24)))
+    }
     private fun warningBox(value: String): TextView = text(value, 14, false).apply {
         background = rounded(if (isDark()) Color.rgb(66, 55, 20) else Color.rgb(255, 248, 225), dp(1), Color.rgb(180, 130, 20), dp(10))
         setPadding(dp(12), dp(10), dp(12), dp(10))
@@ -1718,7 +1995,17 @@ class MainActivity : Activity() {
         setPadding(dp(10), dp(10), dp(10), dp(10))
         setOnClickListener { click() }
     }
+    private fun squareIconButton(drawableRes: Int, description: String, click: () -> Unit): ImageButton = ImageButton(this).apply {
+        setImageResource(drawableRes)
+        contentDescription = description
+        background = outlineBackground(dp(12))
+        setColorFilter(quietControlTextColor())
+        scaleType = ImageView.ScaleType.CENTER
+        setPadding(dp(10), dp(10), dp(10), dp(10))
+        setOnClickListener { click() }
+    }
     private fun spacer(heightDp: Int): View = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, dp(heightDp)) }
+    private fun outlineBackground(radius: Int): GradientDrawable = rounded(Color.TRANSPARENT, dp(1), outlineColor(), radius)
     private fun rounded(fill: Int, strokeWidth: Int, strokeColor: Int, radius: Int): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.RECTANGLE
         cornerRadius = radius.toFloat()
@@ -1738,7 +2025,12 @@ class MainActivity : Activity() {
         }
     }
     private fun purple(): Int = getColor(R.color.graphite_accent)
+    private fun activeTabFillColor(): Int = if (isDark()) Color.rgb(51, 46, 61) else Color.rgb(232, 226, 243)
+    private fun activeTabTextColor(): Int = if (isDark()) Color.rgb(244, 241, 250) else Color.rgb(47, 41, 56)
+    private fun quietControlTextColor(): Int = if (isDark()) Color.rgb(232, 226, 243) else Color.rgb(64, 55, 78)
+    private fun outlineColor(): Int = if (isDark()) purple() else Color.rgb(185, 174, 207)
     private fun backgroundColor(): Int = if (isDark()) Color.rgb(29, 26, 36) else Color.rgb(248, 247, 250)
+    private fun dialogBackgroundColor(): Int = if (isDark()) Color.rgb(42, 38, 51) else Color.WHITE
     private fun cardColor(): Int = if (isDark()) Color.rgb(42, 38, 51) else Color.WHITE
     private fun inputColor(): Int = if (isDark()) Color.rgb(37, 34, 45) else Color.WHITE
     private fun textColor(): Int = if (isDark()) Color.rgb(238, 238, 238) else Color.rgb(32, 33, 36)
@@ -1748,7 +2040,7 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
     private fun formatDate(ms: Long): String = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale("ru", "RU")).format(Date(ms))
 
-    private enum class Screen { CARDS, TESTS, SETTINGS }
+    private enum class Screen { CARDS, TESTS, SETTINGS, STATISTICS }
 }
 
 private fun isLostFolderError(error: Throwable): Boolean {
@@ -1772,17 +2064,29 @@ private fun isLostFolderError(error: Throwable): Boolean {
 class SafStore(private val activity: Activity) {
     private val resolver: ContentResolver = activity.contentResolver
 
+    companion object {
+        private val SERVICE_MIPMAP_DIRS = setOf(
+            "mipmap-mdpi",
+            "mipmap-hdpi",
+            "mipmap-xhdpi",
+            "mipmap-xxhdpi",
+            "mipmap-xxxhdpi"
+        )
+    }
+
     fun displayNameForTree(treeUri: Uri): String {
         return queryName(rootDocumentUri(treeUri)) ?: DocumentsContract.getTreeDocumentId(treeUri).substringAfterLast(':')
     }
 
     fun listDocxFiles(rootTreeUri: Uri): List<DocumentInfo> {
+        ensureNoMediaInServiceMipmapDirs(rootTreeUri)
         return listChildren(rootDocumentUri(rootTreeUri))
             .filter { !it.isDirectory && it.name.endsWith(".docx", ignoreCase = true) && !it.name.startsWith("~$") }
             .sortedBy { it.name.lowercase(Locale.ROOT) }
     }
 
     fun loadTests(rootTreeUri: Uri): TestLoadResult {
+        ensureNoMediaInServiceMipmapDirs(rootTreeUri)
         val testDir = ensureTestDir(rootTreeUri)
         ensureNoMediaInExistingAssets(testDir)
         val warnings = mutableListOf<String>()
@@ -1801,6 +2105,33 @@ class SafStore(private val activity: Activity) {
             }
         }
         return TestLoadResult(tests.sortedBy { it.template.title.lowercase(Locale.ROOT) }, warnings)
+    }
+
+    fun loadExistingTests(rootTreeUri: Uri): TestLoadResult {
+        ensureNoMediaInServiceMipmapDirs(rootTreeUri)
+        val testDir = findTestDir(rootTreeUri) ?: return TestLoadResult(emptyList(), emptyList())
+        val warnings = mutableListOf<String>()
+        val tests = mutableListOf<TestFile>()
+        val files = listChildren(testDir).filter { !it.isDirectory && it.name.endsWith(".json", true) }
+        for (file in files) {
+            try {
+                val text = readText(file.uri)
+                val template = TestTemplate.fromJson(JSONObject(text))
+                tests += TestFile(file.name, file.uri, template)
+            } catch (e: SecurityException) {
+                throw e
+            } catch (e: Exception) {
+                if (isLostFolderError(e)) throw e
+                warnings += "Некоторые тесты не удалось загрузить"
+            }
+        }
+        return TestLoadResult(tests.sortedBy { it.template.title.lowercase(Locale.ROOT) }, warnings.distinct())
+    }
+
+    fun ensureNoMediaInServiceMipmapDirs(rootTreeUri: Uri) {
+        val root = runCatching { rootDocumentUri(rootTreeUri) }.getOrNull() ?: return
+        ensureNoMediaInServiceMipmapDirsUnder(root)
+        runCatching { findTestDir(rootTreeUri) }.getOrNull()?.let { ensureNoMediaInServiceMipmapDirsUnder(it) }
     }
 
     fun createTestFile(rootTreeUri: Uri, name: String, content: String): Uri {
@@ -1898,6 +2229,18 @@ class SafStore(private val activity: Activity) {
         }
     }
 
+    private fun ensureNoMediaInServiceMipmapDirsUnder(parentDir: Uri) {
+        runCatching {
+            listChildren(parentDir)
+                .filter { it.isDirectory && it.name in SERVICE_MIPMAP_DIRS }
+                .forEach { ensureNoMediaQuietly(it.uri) }
+        }
+    }
+
+    private fun ensureNoMediaQuietly(dir: Uri) {
+        runCatching { ensureNoMedia(dir) }
+    }
+
     private fun ensureNoMedia(dir: Uri) {
         try {
             val exists = listChildren(dir).any { !it.isDirectory && it.name == ".nomedia" }
@@ -1944,11 +2287,15 @@ class SafStore(private val activity: Activity) {
     }
 
     private fun ensureTestDir(rootTreeUri: Uri): Uri {
+        findTestDir(rootTreeUri)?.let { return it }
         val root = rootDocumentUri(rootTreeUri)
-        val existing = listChildren(root).firstOrNull { it.isDirectory && it.name == "test" }
-        if (existing != null) return existing.uri
         return DocumentsContract.createDocument(resolver, root, DocumentsContract.Document.MIME_TYPE_DIR, "test")
             ?: throw LostFolderAccessException()
+    }
+
+    private fun findTestDir(rootTreeUri: Uri): Uri? {
+        val root = rootDocumentUri(rootTreeUri)
+        return listChildren(root).firstOrNull { it.isDirectory && it.name == "test" }?.uri
     }
 
     private fun rootDocumentUri(treeUri: Uri): Uri {
