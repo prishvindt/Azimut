@@ -5,6 +5,7 @@ import android.app.DownloadManager
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.IntentFilter
 import android.content.Intent
@@ -18,14 +19,17 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.text.Editable
+import android.text.Html
 import android.text.InputType
 import android.text.TextUtils
 import android.text.TextWatcher
+import android.text.method.LinkMovementMethod
 import android.view.DragEvent
 import android.view.MotionEvent
 import android.view.Gravity
 import android.view.View
 import android.view.Window
+import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -48,6 +52,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlin.math.roundToInt
 import kotlin.random.Random
@@ -55,6 +60,8 @@ import kotlin.random.Random
 class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var saf: SafStore
+    private lateinit var cardStore: CardStore
+    private lateinit var apkgImporter: ApkgImporter
     private lateinit var updateManager: UpdateManager
     private lateinit var contentFrame: FrameLayout
     private lateinit var updateArea: LinearLayout
@@ -68,6 +75,10 @@ class MainActivity : Activity() {
     private var activeScreen = Screen.CARDS
     private var lastTabScreen = Screen.CARDS
     private var runningTestFile: TestFile? = null
+    private var reviewingDeck: AssembledDeck? = null
+    private var reviewingCardIndex = 0
+    private var reviewingAnswerShown = false
+    private var reviewingFlipAnimating = false
     private var availableUpdate: UpdateInfo? = null
     private var updateDismissedThisRun = false
     private var updateExpanded = false
@@ -96,7 +107,7 @@ class MainActivity : Activity() {
         private const val PREF_FOLDER_URI = "question_folder_uri"
         private const val PREF_THEME = "theme_mode"
         private const val PREF_CHANGELOG_1_2_0_SHOWN = "updates_1_2_0_shown"
-        private const val LOST_FOLDER_ACCESS_MESSAGE = "Папка с файлами утеряна. Проверьте правильность пути к папке."
+        private const val LOST_FOLDER_ACCESS_MESSAGE = "Папка с материалами утеряна. Проверьте правильность пути к папке."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -108,6 +119,8 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
 
         saf = SafStore(this)
+        cardStore = CardStore(this)
+        apkgImporter = ApkgImporter(this, cardStore)
         updateManager = UpdateManager(this, prefs)
         contentFrame = findViewById(R.id.contentFrame)
         updateArea = findViewById(R.id.updateArea)
@@ -160,6 +173,11 @@ class MainActivity : Activity() {
             runningTestFile = null
             showTabChrome()
             showTestsTab()
+        } else if (activeScreen == Screen.CARD_REVIEW) {
+            reviewingDeck = null
+            reviewingAnswerShown = false
+            reviewingFlipAnimating = false
+            showCardsTab()
         } else if (activeScreen == Screen.SETTINGS || activeScreen == Screen.STATISTICS) {
             showLastTabScreen()
         } else {
@@ -195,6 +213,9 @@ class MainActivity : Activity() {
 
     private fun showCardsTab() {
         runningTestFile = null
+        reviewingDeck = null
+        reviewingAnswerShown = false
+        reviewingFlipAnimating = false
         activeScreen = Screen.CARDS
         lastTabScreen = Screen.CARDS
         showTabChrome()
@@ -202,19 +223,53 @@ class MainActivity : Activity() {
         setNavigationSelection(Screen.CARDS)
         contentFrame.removeAllViews()
 
-        val empty = verticalContainer().apply {
-            gravity = Gravity.CENTER
+        val rootUri = savedFolderUri()
+        if (rootUri == null) {
+            val empty = verticalContainer().apply { gravity = Gravity.CENTER }
+            empty.addView(centeredText("Сначала выберите папку с материалами.", 18, true))
+            empty.addView(spacer(12))
+            empty.addView(button("Открыть настройки") { showSettingsScreen() })
+            contentFrame.addView(empty)
+            return
         }
-        empty.addView(centeredText("Колоды карточек", 20, true))
-        empty.addView(spacer(8))
-        empty.addView(centeredText("Колоды пока не созданы.", 16, false))
-        empty.addView(spacer(8))
-        empty.addView(centeredText("Нажмите «Меню» → «Создать колоду».", 16, false))
-        contentFrame.addView(empty)
+
+        val decks = try {
+            withFolderAccess(rootUri) { cardStore.loadDeckSummaries(rootUri) } ?: run {
+                showNoFolderSelectedState()
+                return
+            }
+        } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showNoFolderSelectedState()
+                return
+            }
+            showMessage("Ошибка", "Не удалось прочитать колоды карточек: ${e.safeMessage()}")
+            emptyList()
+        }
+
+        val scroll = ScrollView(this).apply { isFillViewport = true }
+        val box = verticalContainer()
+        scroll.addView(box)
+
+        if (decks.isEmpty()) {
+            box.gravity = Gravity.CENTER
+            box.addView(centeredText("Колоды карточек", 20, true))
+            box.addView(spacer(8))
+            box.addView(centeredText("Колоды пока не созданы.", 16, false))
+            box.addView(spacer(8))
+            box.addView(centeredText("Нажмите «Меню» → «Собрать колоду».", 16, false))
+        } else {
+            box.addView(sectionTitle("Колоды карточек"))
+            decks.forEach { deck -> box.addView(deckCard(deck)) }
+        }
+        contentFrame.addView(scroll)
     }
 
     private fun showTestsTab() {
         runningTestFile = null
+        reviewingDeck = null
+        reviewingAnswerShown = false
+        reviewingFlipAnimating = false
         activeScreen = Screen.TESTS
         lastTabScreen = Screen.TESTS
         showTabChrome()
@@ -267,7 +322,7 @@ class MainActivity : Activity() {
         contentFrame.removeAllViews()
         val empty = verticalContainer()
         empty.gravity = Gravity.CENTER
-        empty.addView(text("Папка с вопросами не выбрана", 18, true))
+        empty.addView(centeredText("Сначала выберите папку с материалами.", 18, true))
         empty.addView(spacer(12))
         empty.addView(button("Открыть настройки") { showSettingsScreen() })
         contentFrame.addView(empty)
@@ -275,6 +330,9 @@ class MainActivity : Activity() {
 
     private fun showSettingsScreen() {
         runningTestFile = null
+        reviewingDeck = null
+        reviewingAnswerShown = false
+        reviewingFlipAnimating = false
         activeScreen = Screen.SETTINGS
         showStandaloneChrome()
         contentFrame.removeAllViews()
@@ -288,7 +346,7 @@ class MainActivity : Activity() {
         val folderName = uri?.let { folderUri ->
             withFolderAccess(folderUri) { saf.displayNameForTree(folderUri) }
         }
-        val folderButtonText = if (folderName != null) "Папка: $folderName" else "Выбрать папку с вопросами"
+        val folderButtonText = if (folderName != null) "Папка: $folderName" else "Выбрать папку с материалами"
 
         val folderRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -327,7 +385,7 @@ class MainActivity : Activity() {
     private fun refreshDocxListMessage() {
         val uri = savedFolderUri()
         if (uri == null) {
-            Toast.makeText(this, "Выберите папку с вопросами.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Выберите папку с материалами.", Toast.LENGTH_SHORT).show()
             return
         }
         try {
@@ -396,9 +454,9 @@ class MainActivity : Activity() {
     private fun showCardsMenu() {
         val layout = menuDialogLayout()
         var dialog: AlertDialog? = null
-        layout.addView(menuDialogRow("Создать колоду") {
+        layout.addView(menuDialogRow("Собрать колоду") {
             dialog?.dismiss()
-            showDecksStubDialog()
+            chooseApkgForNewDeck()
         })
         dialog = AlertDialog.Builder(this)
             .setView(layout)
@@ -406,12 +464,250 @@ class MainActivity : Activity() {
         dialog.showRounded()
     }
 
-    private fun showDecksStubDialog() {
+    private fun deckCard(deck: AssembledDeckSummary): View {
+        val card = verticalContainer().apply {
+            background = rounded(cardColor(), dp(1), borderColor(), dp(8))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.setMargins(0, 0, 0, dp(10))
+            layoutParams = lp
+            isClickable = true
+        }
+        card.addView(text(deck.name, 18, true))
+        card.addView(spacer(4))
+        card.addView(text("Карточек: ${deck.cardCount}", 14, false))
+        card.setOnClickListener { openAssembledDeck(deck) }
+        card.setOnLongClickListener {
+            showDeckActions(deck)
+            true
+        }
+        return card
+    }
+
+    private fun showDeckActions(deck: AssembledDeckSummary) {
+        val actions = arrayOf("Изменить", "Удалить")
         AlertDialog.Builder(this)
-            .setTitle("Колоды карточек")
-            .setMessage("Колоды пока не созданы.")
-            .setPositiveButton("ОК", null)
+            .setTitle(deck.name)
+            .setItems(actions) { _, which ->
+                when (which) {
+                    0 -> Toast.makeText(this, "Редактирование будет добавлено позже.", Toast.LENGTH_SHORT).show()
+                    1 -> confirmDeleteDeck(deck)
+                }
+            }
             .showRounded()
+    }
+
+    private fun confirmDeleteDeck(deck: AssembledDeckSummary) {
+        AlertDialog.Builder(this)
+            .setTitle("Удалить собранную колоду?")
+            .setMessage("Набор карточек останется в папке с материалами.")
+            .setNegativeButton("Отмена", null)
+            .setPositiveButton("Удалить") { _, _ -> deleteDeck(deck) }
+            .showRounded()
+    }
+
+    private fun deleteDeck(deck: AssembledDeckSummary) {
+        val rootUri = savedFolderUri()
+        if (rootUri == null) {
+            showNoFolderSelectedState()
+            return
+        }
+        try {
+            withFolderAccess(rootUri) { cardStore.deleteDeck(rootUri, deck.id) } ?: run {
+                showNoFolderSelectedState()
+                return
+            }
+            Toast.makeText(this, "Колода удалена", Toast.LENGTH_SHORT).show()
+            showCardsTab()
+        } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showNoFolderSelectedState()
+                return
+            }
+            showMessage("Ошибка", "Не удалось удалить колоду: ${e.safeMessage()}")
+        }
+    }
+
+    private fun chooseApkgForNewDeck() {
+        val rootUri = savedFolderUri()
+        if (rootUri == null) {
+            showMessage("Папка не выбрана", "Сначала выберите папку с материалами.")
+            return
+        }
+        showBusy("Поиск наборов карточек…", "Поиск наборов...")
+        thread {
+            val result: Any = try {
+                if (!hasPersistedFolderPermission(rootUri)) throw SecurityException()
+                apkgImporter.findPackages(rootUri, maxDepth = 4)
+            } catch (e: Exception) {
+                if (isLostFolderError(e)) LostFolderAccess else ErrorResult(e.safeMessage())
+            }
+            runOnUiThread {
+                hideBusy()
+                when (result) {
+                    LostFolderAccess -> {
+                        handleLostFolderAccess()
+                        showNoFolderSelectedState()
+                    }
+                    is ErrorResult -> showMessage("Ошибка", "Не удалось найти наборы карточек: ${result.message}")
+                    is List<*> -> {
+                        @Suppress("UNCHECKED_CAST")
+                        val packages = result as List<FoundApkgPackage>
+                        if (packages.isEmpty()) {
+                            showMessage(
+                                "Наборы карточек не найдены.",
+                                "Скачайте или поместите наборы карточек в папку с материалами, затем повторите поиск."
+                            )
+                        } else {
+                            showApkgSelectionDialog(rootUri, packages)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun showApkgSelectionDialog(rootUri: Uri, packages: List<FoundApkgPackage>) {
+        val checked = BooleanArray(packages.size)
+        val listBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+        packages.forEachIndexed { index, item ->
+            val cb = CheckBox(this).apply {
+                text = if (item.relativePath == item.name) item.name else "${item.name}\n${item.relativePath}"
+                textSize = 16f
+                setTextColor(textColor())
+                setPadding(dp(4), dp(8), dp(4), dp(8))
+                setOnCheckedChangeListener { _, isChecked -> checked[index] = isChecked }
+            }
+            listBox.addView(cb)
+            if (index != packages.lastIndex) listBox.addView(optionDivider())
+        }
+        val scroll = ScrollView(this).apply { addView(listBox) }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Выберите наборы .apkg и .zip")
+            .setView(scroll)
+            .setNegativeButton("Отмена", null)
+            .setPositiveButton("Далее", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val selected = packages.filterIndexed { index, _ -> checked[index] }
+                if (selected.isEmpty()) {
+                    Toast.makeText(this, "Выберите хотя бы один набор карточек", Toast.LENGTH_SHORT).show()
+                } else {
+                    dialog.dismiss()
+                    showCreateDeckDialog(rootUri, selected)
+                }
+            }
+        }
+        dialog.showRounded()
+    }
+
+    private fun showCreateDeckDialog(rootUri: Uri, packages: List<FoundApkgPackage>) {
+        val layout = dialogLayout()
+        val defaultName = if (packages.size == 1) packages.first().name.substringBeforeLast('.') else "Колода из ${packages.size} наборов"
+        val nameInput = EditText(this).apply {
+            hint = "Название колоды"
+            setText(defaultName)
+            setSingleLine(true)
+            imeOptions = EditorInfo.IME_ACTION_DONE
+        }
+        layout.addView(label("Выбрано наборов"))
+        layout.addView(text(packages.joinToString("\n") { "• ${it.relativePath}" }, 14, false))
+        layout.addView(spacer(10))
+        layout.addView(label("Название колоды"))
+        layout.addView(nameInput)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Собрать колоду")
+            .setView(layout)
+            .setNegativeButton("Отмена", null)
+            .setPositiveButton("Сохранить", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val title = nameInput.text.toString().trim()
+                if (title.isBlank()) {
+                    nameInput.error = "Введите название колоды."
+                    Toast.makeText(this, "Введите название колоды.", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                dialog.dismiss()
+                assembleDeck(rootUri, packages, title)
+            }
+        }
+        dialog.showRounded()
+    }
+
+    private fun assembleDeck(rootUri: Uri, packages: List<FoundApkgPackage>, title: String) {
+        val cancelled = AtomicBoolean(false)
+        showBusy(
+            title = "Сборка колоды…",
+            message = "Подготовка...",
+            cancelText = "Отмена"
+        ) {
+            cancelled.set(true)
+            updateBusy("Сборка колоды не завершена.")
+        }
+        thread {
+            var deckId: String? = null
+            val result: Any = try {
+                if (!hasPersistedFolderPermission(rootUri)) throw SecurityException()
+                val newDeckId = UUID.randomUUID().toString()
+                deckId = newDeckId
+                val progress = { value: CardImportProgress -> updateBusy(value.message) }
+                val importResult = apkgImporter.importPackages(
+                    rootTreeUri = rootUri,
+                    assembledDeckId = newDeckId,
+                    deckName = title,
+                    packages = packages,
+                    progress = progress,
+                    isCancelled = { cancelled.get() }
+                )
+                if (cancelled.get()) throw CardImportCancelledException()
+                if (importResult.importedCardCount == 0) {
+                    cardStore.discardDeckMedia(rootUri, newDeckId)
+                    ErrorResult("Не удалось прочитать набор карточек.")
+                } else {
+                    progress(CardImportProgress("Сохранение колоды..."))
+                    cardStore.saveDeck(rootUri, importResult.deck)
+                    CardImportUiResult(importResult)
+                }
+            } catch (e: CardImportCancelledException) {
+                deckId?.let { cardStore.discardDeckMedia(rootUri, it) }
+                ErrorResult("Сборка колоды не завершена.")
+            } catch (e: Exception) {
+                if (isLostFolderError(e)) LostFolderAccess else ErrorResult(e.safeMessage())
+            }
+            runOnUiThread {
+                hideBusy()
+                when (result) {
+                    LostFolderAccess -> {
+                        handleLostFolderAccess()
+                        showNoFolderSelectedState()
+                    }
+                    is ErrorResult -> showMessage("Ошибка", result.message)
+                    is CardImportUiResult -> {
+                        val messages = mutableListOf<String>()
+                        if (result.result.failedPackageCount > 0) messages += "Некоторые наборы карточек не удалось прочитать."
+                        if (result.result.skippedCardCount > 0) messages += "Колода собрана. Некоторые карточки не удалось импортировать."
+                        if (result.result.skippedMediaCount > 0) messages += "Колода собрана. Некоторые медиафайлы не удалось импортировать."
+                        if (messages.isEmpty()) {
+                            Toast.makeText(this, "Колода собрана.", Toast.LENGTH_SHORT).show()
+                            showCardsTab()
+                        } else {
+                            AlertDialog.Builder(this)
+                                .setTitle("Колода собрана")
+                                .setMessage(messages.joinToString("\n\n"))
+                                .setPositiveButton("ОК") { _, _ -> showCardsTab() }
+                                .showRounded()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun showStatisticsScreen() {
@@ -472,7 +768,7 @@ class MainActivity : Activity() {
     private fun chooseDocxForNewTest() {
         val uri = savedFolderUri()
         if (uri == null) {
-            showMessage("Папка не выбрана", "Сначала выберите папку с вопросами.")
+            showMessage("Папка не выбрана", "Сначала выберите папку с материалами.")
             return
         }
         val files = try {
@@ -786,7 +1082,7 @@ class MainActivity : Activity() {
     private fun openTest(file: TestFile) {
         val rootUri = savedFolderUri()
         if (rootUri == null) {
-            showMessage("Папка не выбрана", "Сначала выберите папку с вопросами.")
+            showMessage("Папка не выбрана", "Сначала выберите папку с материалами.")
             return
         }
         val template = file.template
@@ -1225,6 +1521,266 @@ class MainActivity : Activity() {
         return true
     }
 
+    private fun openAssembledDeck(summary: AssembledDeckSummary) {
+        val rootUri = savedFolderUri()
+        if (rootUri == null) {
+            showNoFolderSelectedState()
+            return
+        }
+        val deck = try {
+            withFolderAccess(rootUri) { cardStore.loadDeck(rootUri, summary.id) } ?: run {
+                showNoFolderSelectedState()
+                return
+            }
+        } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showNoFolderSelectedState()
+                return
+            }
+            showMessage("Ошибка", "Не удалось открыть колоду: ${e.safeMessage()}")
+            return
+        }
+        if (deck.cards.isEmpty()) {
+            showMessage("Колода не открыта", "В колоде нет карточек.")
+            return
+        }
+        reviewingDeck = deck
+        reviewingCardIndex = 0
+        reviewingAnswerShown = false
+        reviewingFlipAnimating = false
+        showCardReviewScreen()
+    }
+
+    private fun showCardReviewScreen() {
+        val deck = reviewingDeck ?: run {
+            showCardsTab()
+            return
+        }
+        if (reviewingCardIndex !in deck.cards.indices) {
+            Toast.makeText(this, "Карточки закончились.", Toast.LENGTH_SHORT).show()
+            showCardsTab()
+            return
+        }
+        runningTestFile = null
+        activeScreen = Screen.CARD_REVIEW
+        lastTabScreen = Screen.CARDS
+        showStandaloneChrome()
+        contentFrame.removeAllViews()
+
+        val root = standaloneRoot(deck.name)
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(10))
+            setBackgroundColor(backgroundColor())
+        }
+        val card = deck.cards[reviewingCardIndex]
+
+        val counter = text("Карточка ${reviewingCardIndex + 1} из ${deck.cards.size}", 15, true).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, dp(2), 0, dp(6))
+        }
+        body.addView(counter, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        val flashcard = flashcardSurface()
+        populateFlashcard(flashcard, card)
+        body.addView(flashcard, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply {
+            setMargins(0, dp(8), 0, dp(12))
+        })
+
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        buttons.addView(button("Повторить") { answerCurrentCard(known = false) }, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+            setMargins(0, 0, dp(6), 0)
+        })
+        buttons.addView(button("Знаю") { answerCurrentCard(known = true) }, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+            setMargins(dp(6), 0, 0, 0)
+        })
+        body.addView(buttons, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        root.addView(body, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        contentFrame.addView(root)
+    }
+
+    private fun flashcardSurface(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        background = rounded(cardColor(), dp(1), borderColor(), dp(18))
+        elevation = dp(4).toFloat()
+        setPadding(dp(18), dp(18), dp(18), dp(18))
+        isClickable = true
+        isFocusable = true
+        cameraDistance = resources.displayMetrics.density * 8000f
+    }
+
+    private fun populateFlashcard(container: LinearLayout, card: ImportedCard) {
+        container.removeAllViews()
+        container.rotationY = 0f
+        installFlashcardTapTarget(container, container, card)
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+        }
+        installFlashcardTapTarget(scroll, container, card)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+        }
+        installFlashcardTapTarget(content, container, card)
+        scroll.addView(content, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        val html = if (reviewingAnswerShown) card.backHtml else card.frontHtml
+        val media = if (reviewingAnswerShown) card.backMedia else card.frontMedia
+        if (html.isNotBlank()) {
+            val textView = htmlText(html, if (reviewingAnswerShown) 18 else 19, !reviewingAnswerShown).apply {
+                movementMethod = null
+                linksClickable = false
+                gravity = Gravity.CENTER
+                textAlignment = View.TEXT_ALIGNMENT_CENTER
+                setPadding(dp(4), dp(4), dp(4), dp(4))
+            }
+            installFlashcardTapTarget(textView, container, card)
+            content.addView(textView)
+        } else {
+            val empty = centeredText("Пустая сторона карточки", 16, false)
+            installFlashcardTapTarget(empty, container, card)
+            content.addView(empty)
+        }
+        addCardMediaViews(content, media, container, card)
+        container.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT))
+    }
+
+    private fun installFlashcardTapTarget(view: View, container: LinearLayout, card: ImportedCard) {
+        view.isClickable = true
+        view.setOnClickListener { flipFlashcard(container, card) }
+    }
+
+    private fun flipFlashcard(container: LinearLayout, card: ImportedCard) {
+        if (reviewingFlipAnimating) return
+        reviewingFlipAnimating = true
+        container.isClickable = false
+        container.animate()
+            .rotationY(90f)
+            .setDuration(140L)
+            .setInterpolator(AccelerateDecelerateInterpolator())
+            .withEndAction {
+                reviewingAnswerShown = !reviewingAnswerShown
+                populateFlashcard(container, card)
+                container.rotationY = -90f
+                container.animate()
+                    .rotationY(0f)
+                    .setDuration(160L)
+                    .setInterpolator(AccelerateDecelerateInterpolator())
+                    .withEndAction {
+                        reviewingFlipAnimating = false
+                        container.isClickable = true
+                    }
+                    .start()
+            }
+            .start()
+    }
+
+    private fun answerCurrentCard(known: Boolean) {
+        val deck = reviewingDeck ?: return
+        val card = deck.cards.getOrNull(reviewingCardIndex) ?: return
+        val rootUri = savedFolderUri()
+        if (rootUri == null) {
+            showNoFolderSelectedState()
+            return
+        }
+        try {
+            withFolderAccess(rootUri) { cardStore.markCardAnswer(rootUri, deck.id, card.id, known) } ?: run {
+                showNoFolderSelectedState()
+                return
+            }
+        } catch (e: Exception) {
+            if (handleLostFolderError(e)) {
+                showNoFolderSelectedState()
+                return
+            }
+            Toast.makeText(this, "Не удалось сохранить прогресс", Toast.LENGTH_SHORT).show()
+        }
+        reviewingCardIndex += 1
+        reviewingAnswerShown = false
+        reviewingFlipAnimating = false
+        if (reviewingCardIndex >= deck.cards.size) {
+            Toast.makeText(this, "Карточки закончились.", Toast.LENGTH_SHORT).show()
+            showCardsTab()
+        } else {
+            showCardReviewScreen()
+        }
+    }
+
+    private fun addCardMediaViews(parent: LinearLayout, media: List<CardMediaRef>, flipContainer: LinearLayout? = null, card: ImportedCard? = null) {
+        if (media.isEmpty()) return
+        parent.addView(spacer(10))
+        val rootUri = savedFolderUri()
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        if (flipContainer != null && card != null) installFlashcardTapTarget(row, flipContainer, card)
+        for (ref in media) {
+            val exists = rootUri != null && runCatching { cardStore.mediaExists(rootUri, ref) }.getOrDefault(false)
+            if (exists) {
+                val button = squareIconButton(mediaIconFor(ref.type), mediaDescription(ref.type)) { openCardMedia(ref) }
+                row.addView(button, LinearLayout.LayoutParams(dp(48), dp(48)).apply { setMargins(0, 0, dp(8), 0) })
+            } else {
+                val missing = text("Файл не найден.", 13, false).apply {
+                    setPadding(0, 0, dp(10), 0)
+                }
+                if (flipContainer != null && card != null) installFlashcardTapTarget(missing, flipContainer, card)
+                row.addView(missing)
+            }
+        }
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(row)
+        }
+        if (flipContainer != null && card != null) installFlashcardTapTarget(scroll, flipContainer, card)
+        parent.addView(scroll)
+    }
+
+    private fun openCardMedia(ref: CardMediaRef) {
+        val rootUri = savedFolderUri()
+        if (rootUri == null) {
+            showNoFolderSelectedState()
+            return
+        }
+        val uri = runCatching { cardStore.resolveMediaUri(rootUri, ref) }.getOrNull()
+        if (uri == null) {
+            Toast.makeText(this, "Не удалось открыть файл.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, ref.mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newUri(contentResolver, ref.fileName, uri)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "Не удалось открыть файл.", Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
+            Toast.makeText(this, "Не удалось открыть файл.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun mediaIconFor(type: CardMediaType): Int = when (type) {
+        CardMediaType.IMAGE -> R.drawable.ic_image_24
+        CardMediaType.AUDIO -> R.drawable.ic_audio_24
+        CardMediaType.VIDEO -> R.drawable.ic_video_24
+    }
+
+    private fun mediaDescription(type: CardMediaType): String = when (type) {
+        CardMediaType.IMAGE -> "Изображение"
+        CardMediaType.AUDIO -> "Аудио"
+        CardMediaType.VIDEO -> "Видео"
+    }
+
     private fun setNavigationSelection(screen: Screen) {
         val cardsSelected = screen == Screen.CARDS
         val testsSelected = screen == Screen.TESTS
@@ -1242,20 +1798,64 @@ class MainActivity : Activity() {
         outlineBackground(dp(12))
     }
 
-    private fun openBusyDialog(message: String): AlertDialog = AlertDialog.Builder(this)
-        .setTitle(message)
-        .setView(LinearLayout(this).apply { setPadding(dp(24), dp(18), dp(24), dp(18)); addView(text("Подождите…", 16, false)) })
-        .setCancelable(false)
-        .create()
-
     private var busyDialog: AlertDialog? = null
-    private fun showBusy(message: String) {
-        busyDialog?.dismiss()
-        busyDialog = openBusyDialog(message).showRounded()
+    private var busyMessageText: TextView? = null
+
+    private fun openBusyDialog(
+        title: String,
+        message: String = "Подождите…",
+        cancelText: String? = null,
+        onCancel: (() -> Unit)? = null
+    ): AlertDialog {
+        val messageView = text(message, 16, false)
+        busyMessageText = messageView
+        val builder = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(LinearLayout(this).apply {
+                setPadding(dp(24), dp(18), dp(24), dp(18))
+                addView(messageView)
+            })
+            .setCancelable(cancelText != null)
+        if (cancelText != null) builder.setNegativeButton(cancelText, null)
+        val dialog = builder.create()
+        dialog.setOnShowListener {
+            if (cancelText != null) {
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                    onCancel?.invoke()
+                    dialog.dismiss()
+                }
+            }
+        }
+        dialog.setOnDismissListener {
+            if (busyDialog == dialog) {
+                busyDialog = null
+                busyMessageText = null
+            }
+        }
+        return dialog
     }
+
+    private fun showBusy(
+        title: String,
+        message: String = "Подождите…",
+        cancelText: String? = null,
+        onCancel: (() -> Unit)? = null
+    ) {
+        busyDialog?.dismiss()
+        busyMessageText = null
+        busyDialog = openBusyDialog(title, message, cancelText, onCancel).showRounded()
+    }
+
+    private fun updateBusy(message: String) {
+        runOnUiThread {
+            busyMessageText?.text = message
+        }
+    }
+
     private fun hideBusy() {
         busyDialog?.dismiss()
         busyDialog = null
+        busyMessageText = null
     }
 
     private fun savedFolderUri(): Uri? {
@@ -1725,6 +2325,10 @@ class MainActivity : Activity() {
         if (bold) typeface = Typeface.DEFAULT_BOLD
         includeFontPadding = true
     }
+    private fun htmlText(value: String, sp: Int, bold: Boolean): TextView = text("", sp, bold).apply {
+        text = Html.fromHtml(value, Html.FROM_HTML_MODE_LEGACY)
+        movementMethod = LinkMovementMethod.getInstance()
+    }
     private fun centeredText(value: String, sp: Int, bold: Boolean): TextView = text(value, sp, bold).apply {
         gravity = Gravity.CENTER
         textAlignment = View.TEXT_ALIGNMENT_CENTER
@@ -1909,5 +2513,7 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
     private fun formatDate(ms: Long): String = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale("ru", "RU")).format(Date(ms))
 
-    private enum class Screen { CARDS, TESTS, SETTINGS, STATISTICS }
+    private data class CardImportUiResult(val result: ApkgImportResult)
+
+    private enum class Screen { CARDS, TESTS, SETTINGS, STATISTICS, CARD_REVIEW }
 }
